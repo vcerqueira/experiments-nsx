@@ -4,107 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
 from neuralforecast.losses.pytorch import MAE
 from neuralforecast.common._base_windows import BaseWindows
-from neuralforecast.common._modules import MLP as MLPLayer, AttentionLayer
+from neuralforecast.common._modules import MLP as MLPLayer
 from neuralforecast.models import MLP as MLP
 
 from src.pooling import SparsePooling
 
 from neuralforecast.models.nbeats import NBEATS
-
-
-class EnhancedAttentionGate(nn.Module):
-    def __init__(self, input_size, num_experts, n_heads=4, d_model=64, dropout=0.1):
-        super().__init__()
-        self.n_heads = n_heads
-        self.d_model = d_model
-
-        # Input projection
-        self.input_proj = nn.Linear(1, d_model)  # Project scalar values to d_model
-
-        # Multi-head attention
-        self.attention = FullAttention(
-            mask_flag=True,  # Use causal masking
-            attention_dropout=dropout,
-            output_attention=True
-        )
-
-        # Projections for Q, K, V
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-
-        # Output projection
-        self.out_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, num_experts)
-        )
-
-    def forward(self, x):
-        # x shape: [batch_size, seq_length]
-        B, L = x.shape
-        H = self.n_heads
-
-        # Project input
-        x = x.unsqueeze(-1)  # [B, L, 1]
-        x = self.input_proj(x)  # [B, L, d_model]
-
-        # Prepare Q, K, V
-        q = self.q_proj(x).view(B, L, H, -1)  # [B, L, H, d_model/H]
-        k = self.k_proj(x).view(B, L, H, -1)  # [B, L, H, d_model/H]
-        v = self.v_proj(x).view(B, L, H, -1)  # [B, L, H, d_model/H]
-
-        # Apply attention
-        out, attn = self.attention(q, k, v, attn_mask=None)  # [B, L, H, d_model/H]
-
-        # Reshape and project to num_experts
-        out = out.contiguous().view(B, L, self.d_model)  # [B, L, d_model]
-        out = out[:, -1]  # Take last timestep: [B, d_model]
-
-        return self.out_proj(out)  # [B, num_experts]
-
-
-
-
-class RNNGate(nn.Module):
-    def __init__(self, input_size, num_experts, hidden_size=32):
-        super().__init__()
-        self.gru = nn.GRU(
-            input_size=1,  # Process one timestep at a time
-            hidden_size=hidden_size,
-            batch_first=True
-        )
-        self.proj = nn.Linear(hidden_size, num_experts)
-
-    def forward(self, x):
-        # x shape: [batch_size, seq_length]
-        x = x.unsqueeze(-1)  # Add feature dim: [batch, seq, 1]
-        _, h_n = self.gru(x)  # h_n shape: [1, batch, hidden]
-        return self.proj(h_n.squeeze(0))  # [batch, num_experts]
-class AttentionGate(nn.Module):
-    def __init__(self, input_size, num_experts, hidden_size=32):
-        super().__init__()
-        self.query = nn.Parameter(torch.randn(hidden_size))
-        self.key_proj = nn.Linear(1, hidden_size)
-        self.value_proj = nn.Linear(1, hidden_size)
-        self.out_proj = nn.Linear(hidden_size, num_experts)
-
-    def forward(self, x):
-        # x shape: [batch_size, seq_length]
-        x = x.unsqueeze(-1)  # [batch, seq, 1]
-        keys = self.key_proj(x)  # [batch, seq, hidden]
-        values = self.value_proj(x)  # [batch, seq, hidden]
-
-        # Compute attention scores
-        scores = torch.matmul(keys, self.query) / math.sqrt(keys.size(-1))
-        attn_weights = F.softmax(scores, dim=1)  # [batch, seq]
-
-        # Weighted sum of values
-        context = torch.bmm(attn_weights.unsqueeze(1), values).squeeze(1)
-        return self.out_proj(context)
 
 
 class SimpleMoe(BaseWindows):
@@ -240,28 +147,15 @@ class SimpleMoe(BaseWindows):
         if gate is not None:
             self.gate = gate
         else:
-            # self.gate = MLPLayer(
-            #     self.input_size,
-            #     self.num_experts,
-            #     activation="Sigmoid",
-            #     hidden_size=32,
-            #     num_layers=1,
-            #     dropout=0.1)
+            self.gate = MLPLayer(
+                self.input_size,
+                self.num_experts,
+                activation="Sigmoid",
+                hidden_size=32,
+                num_layers=1,
+                dropout=0.1)
 
-            # self.gate = AttentionGate(self.input_size, self.num_experts)
-
-            # self.gate = EnhancedAttentionGate(
-            #     input_size=self.input_size,
-            #     num_experts=self.num_experts,
-            #     n_heads=4,
-            #     d_model=64,
-            #     dropout=0.1
-            # )
-
-            # self.gate=RNNGate(input_size=self.input_size,
-            #     num_experts=self.num_experts,)
-
-            self.gate = nn.Linear(self.input_size, self.num_experts, bias=False)
+            # self.gate = nn.Linear(self.input_size, self.num_experts, bias=False)
 
         self.softmax = nn.Softmax(dim=1)
         self.k = 3
@@ -271,13 +165,7 @@ class SimpleMoe(BaseWindows):
         # else:
         #     self.pooling = SparsePooling(self.experts, self.gate, self.h, k=2)
 
-    def get_temperature(self):
-        init_temp = 2.0
-        final_temp = 0.5
-        progress = min(1.0, self.current_step / 1000)  # Anneal over 1000 steps
-        return max(final_temp, init_temp - progress * (init_temp - final_temp))
-
-    def forward2(self, windows_batch: dict, return_components: bool = False) -> Union[
+    def forward(self, windows_batch: dict, return_components: bool = False) -> Union[
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Args:
@@ -317,101 +205,24 @@ class SimpleMoe(BaseWindows):
 
             return weighted_sum
 
-    def forward(self, windows_batch: dict, return_components: bool = False):
-        insample_y = windows_batch['insample_y']
-        batch_size = insample_y.size(0)
-
-        # Compute gate logits and full probabilities for training
-        gate_logits = self.gate(insample_y)
-        full_gate_weights = self.softmax(gate_logits)  # [batch_size, num_experts]
-
-        # Get top-k for sparse routing
-        topk_values, topk_indices = torch.topk(gate_logits, k=3, dim=1)
-        sparse_gate_weights = torch.zeros_like(full_gate_weights)
-
-        sparse_gate_weights.scatter_(1, topk_indices, self.softmax(topk_values))
-
-        # temp
-        # temperature1 = self.get_temperature()
-        # sparse_gate_weights.scatter_(1, topk_indices,
-        #                              self.softmax(topk_values / temperature1))
-
-        if return_components:
-            expert_outputs = torch.zeros(batch_size, len(self.experts), self.h, device=insample_y.device)
-
-            # Use enumerate to get both index and expert module
-            for expert_idx, expert_module in enumerate(self.experts):
-                # Only compute for experts used in sparse routing
-                if (topk_indices == expert_idx).any():
-                    expert_output = expert_module(windows_batch)
-                    expert_outputs[:, expert_idx] = expert_output
-
-            combined_output = (expert_outputs * sparse_gate_weights.unsqueeze(-1)).sum(dim=1)
-            return combined_output, expert_outputs, full_gate_weights
-
-        else:
-            weighted_sum = torch.zeros(batch_size, self.h, device=insample_y.device)
-
-            # Use enumerate to get both index and expert module
-            for expert_idx, expert_module in enumerate(self.experts):
-                if (topk_indices == expert_idx).any():
-                    expert_output = expert_module(windows_batch)
-                    weighted_sum += expert_output * sparse_gate_weights[:, expert_idx].unsqueeze(1)
-
-            return weighted_sum
-    def get_lambda_div(self):
-        """Dynamic diversity weight based on training progress"""
-        # Start small and increase
-        # return min(0.5, self.current_step / 2000)
-
-        # OR start large and decrease
-        return max(0.1, 1.0 - self.current_step / 2000)
-
-    def ncl_loss(self, expert_outputs, target, lambda_div=0.1):
+    @staticmethod
+    def negative_minmax_norm(x: torch.Tensor) -> torch.Tensor:
         """
-        Implement Negative Correlation Learning
-        expert_outputs: [batch_size, num_experts, horizon]
-        target: [batch_size, horizon]
+        Performs min-max normalization on the negative of a vector.
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Normalized tensor in [0,1] range
         """
-        batch_size, num_experts, horizon = expert_outputs.size()
+        neg_x = -x  # Take negative of input
+        min_val = neg_x.min()
+        max_val = neg_x.max()
 
-        # Get ensemble mean prediction
-        ensemble_mean = expert_outputs.mean(dim=1, keepdim=True)  # [batch_size, 1, horizon]
-
-        # NCL penalty term for each expert
-        ncl_terms = []
-        for i in range(num_experts):
-            expert_pred = expert_outputs[:, i:i + 1]  # [batch_size, 1, horizon]
-
-            # Correlation term: (f_i - f_bar)(f_j - f_bar) for j≠i
-            others = torch.cat([expert_outputs[:, :i], expert_outputs[:, i + 1:]], dim=1)
-            others_mean = others.mean(dim=1, keepdim=True)  # [batch_size, 1, horizon]
-
-            correlation = (expert_pred - ensemble_mean) * (others_mean - ensemble_mean)
-            correlation = correlation.mean()
-
-            ncl_terms.append(correlation)
-
-        ncl_penalty = torch.stack(ncl_terms).mean()
-        return ncl_penalty
-
-    def specialization_loss(self, expert_outputs, gate_weights):
-        """
-        Encourage each expert to specialize by penalizing when multiple experts
-        make similar predictions on samples where they have high gate weights
-        """
-        # Get pairwise differences between expert predictions
-        # [batch, num_experts, num_experts, horizon]
-        pairwise_diffs = (expert_outputs.unsqueeze(2) - expert_outputs.unsqueeze(1)).abs()
-
-        # Weight the differences by gate weights
-        # Only care when both experts have high weights
-        gate_products = gate_weights.unsqueeze(2) * gate_weights.unsqueeze(1)
-
-        # Compute loss - we want large differences when gate weights are high
-        spec_loss = -(pairwise_diffs.mean(-1) * gate_products).mean()
-
-        return spec_loss
+        # Min-max normalization: (x - min)/(max - min)
+        normalized = (neg_x - min_val) / (max_val - min_val)
+        return normalized
 
     def training_step(self, batch, batch_idx):
         # Create and normalize windows [Ws, L+H, C]
@@ -459,16 +270,21 @@ class SimpleMoe(BaseWindows):
         expert_losses_tensor = torch.stack(expert_losses)  # [num_experts]
         expert_loss = expert_losses_tensor.mean()
 
+        # target_weights = 1.0 / (expert_losses_tensor + 1e-10)  # Add epsilon for numerical stability
+        # target_weights = target_weights / target_weights.sum()
+
         # Softmax-based weighting
-        temperature = 1
+        temperature=1
         expert_scores = -expert_losses_tensor  # Convert losses to scores
         target_weights = F.softmax(expert_scores / temperature, dim=0)
+        # target_weights = self.negative_minmax_norm(expert_losses_tensor)
 
-        target_weights_expanded = target_weights.unsqueeze(0).expand(gate_weights.size(0), -1)
-
-        # Compute per-instance gate loss
-        gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
-        # gate_loss = F.mse_loss(gate_weights.mean(0),target_weights)
+        # gate_loss = F.kl_div(
+        #     gate_weights.mean(0).log(),  # Average predicted weights across batch
+        #     target_weights,
+        #     reduction='batchmean'
+        # )
+        gate_loss = F.mse_loss(gate_weights.mean(0),target_weights)
 
         # print("gate_loss")
         # print(gate_loss)
@@ -481,6 +297,23 @@ class SimpleMoe(BaseWindows):
             combined_loss = self.loss(y=original_outsample_y, distr_args=distr_args, mask=outsample_mask)
         else:
             combined_loss = self.loss(y=outsample_y, y_hat=output, mask=outsample_mask)
+
+        # Gate balance loss - encourage uniform expert utilization
+        # gate_entropy = -(gate_weights * torch.log(gate_weights + 1e-10)).sum(1).mean()
+        # target_usage = torch.ones_like(gate_weights) / gate_weights.size(1)
+        # balance_loss = F.kl_div(
+        #     gate_weights.log(),
+        #     target_usage,
+        #     reduction='batchmean'
+        # )
+
+        # Combine losses with weights
+        # expert_loss = torch.stack(expert_losses).mean()
+        # gate_loss = balance_loss - 0.1 * gate_entropy  # Encourage diversity with negative entropy
+        # print("expert_loss")
+        # print(expert_loss)
+        # print("gate_loss")
+        # print(gate_loss)
 
         # p = np.random.random()
         # total_loss = p * expert_loss + (1-p) * gate_loss
@@ -498,13 +331,6 @@ class SimpleMoe(BaseWindows):
         # # Option 2: Use annealing schedule
         expert_weight = min(1.0, self.current_step / 1000)  # Gradually increase expert importance
         total_loss = expert_weight * expert_loss + (1 - expert_weight) * gate_loss
-
-        # Compute specialization loss
-        # expert_weight = min(1.0, self.current_step / 1000)  # Gradually increase expert importance
-        # spec_loss = self.specialization_loss(expert_outputs, gate_weights)
-        # total_loss = (expert_weight * expert_loss +
-        #               (1 - expert_weight) * gate_loss +
-        #               0.1 * spec_loss)  # Small weight for specialization
 
         # Log all components
         self.log("combined_loss", combined_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
@@ -532,5 +358,5 @@ class SimpleMoe(BaseWindows):
         )
         self.train_trajectories.append((self.global_step, total_loss.detach().item()))
 
-        self.current_step += 1
+        self.current_step+=1
         return total_loss
