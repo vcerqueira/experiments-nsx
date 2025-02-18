@@ -135,9 +135,7 @@ class SimpleMoe(BaseWindows):
                  sparse_gate: bool = False,  # [True,False]
                  gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','kl']
                  add_specialization_loss: bool = False,
-                 specialization_factor: float = 0.2,
-                 total_loss_type: str = 'annealing',  # ['random', 'annealing','sumsqr']
-                 annealing_temperature: int = 1000,
+                 total_loss_type: str = 'annealing',  # ['random', 'annealing']
                  **trainer_kwargs):
 
         super(SimpleMoe, self).__init__(h=h,
@@ -190,7 +188,7 @@ class SimpleMoe(BaseWindows):
             self.gate = MLPLayer(
                 self.input_size,
                 self.num_experts,
-                activation="ReLU",
+                activation="Sigmoid",
                 hidden_size=32,
                 num_layers=1,
                 dropout=0.1)
@@ -208,8 +206,6 @@ class SimpleMoe(BaseWindows):
 
         self.gate_loss_type = gate_loss_type
         self.total_loss_type = total_loss_type
-        self.specialization_factor = specialization_factor
-        self.annealing_temperature = annealing_temperature
 
     def get_temperature(self):
         init_temp = 2.0
@@ -231,7 +227,7 @@ class SimpleMoe(BaseWindows):
         if return_components:
             sparse_ = False
         else:
-            sparse_ = self.sparse_gate
+            sparse_ = sparse
 
         insample_y = windows_batch['insample_y']
         batch_size = insample_y.size(0)
@@ -332,13 +328,15 @@ class SimpleMoe(BaseWindows):
 
             gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
         else:
+            temperature = 1
             expert_scores = -expert_losses_tensor  # Convert losses to scores
-            target_weights = expert_scores / expert_scores.sum()
-            # target_weights = expert_scores / expert_scores.sum(dim=0)
-            # target_weights_expanded = target_weights.unsqueeze(0).expand(gate_weights.size(0), -1)
+            target_weights = F.softmax(expert_scores / temperature, dim=0)
 
-            gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
-            # gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
+            gate_loss = F.kl_div(
+                gate_weights.mean(0).log(),  # Average predicted weights across batch
+                target_weights,
+                reduction='batchmean'
+            )
 
         # Compute combined loss
         if self.loss.is_distribution_output:
@@ -354,19 +352,16 @@ class SimpleMoe(BaseWindows):
             p = np.random.random()
             total_loss = p * expert_loss + (1 - p) * gate_loss
         elif self.total_loss_type == 'annealing':
-            expert_weight = min(1.0,
-                                self.current_step / self.annealing_temperature)  # Gradually increase expert importance
+            expert_weight = min(1.0, self.current_step / 1000)  # Gradually increase expert importance
             total_loss = expert_weight * expert_loss + (1 - expert_weight) * gate_loss
-        elif self.total_loss_type == 'sum':
-            # sum
-            total_loss = (expert_loss + gate_loss)
         else:
-            print(self.total_loss_type)
-            raise ValueError("self.total_loss_type")
+            # same
+            expert_weight = min(1.0, self.current_step / 1000)  # Gradually increase expert importance
+            total_loss = expert_weight * expert_loss + (1 - expert_weight) * gate_loss
 
         if self.add_specialization_loss:
             spec_loss = self.specialization_loss(expert_outputs, gate_weights)
-            total_loss += self.specialization_factor * spec_loss  # Small weight for specialization
+            total_loss += 0.05 * spec_loss  # Small weight for specialization
 
         # Log all components
         self.log("combined_loss", combined_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)

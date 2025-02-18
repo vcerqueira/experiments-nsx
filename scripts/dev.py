@@ -14,32 +14,43 @@ from utils.load_data.config import DATASETS
 
 from src.moe import SimpleMoe
 
-data_name = 'Tourism'
+data_name = 'M4'
 # data_name = 'Gluonts'
 group = 'Monthly'
 data_loader = DATASETS[data_name]
 min_samples = data_loader.min_samples[group]
 df, horizon, n_lags, freq_str, freq_int = data_loader.load_everything(group, min_n_instances=min_samples)
-df = data_loader.prune_df_by_size(df,min_n_instances=200)
+df = data_loader.prune_df_by_size(df, min_n_instances=500)
 
 print(df['unique_id'].value_counts())
 print(df.shape)
-horizon=3
+horizon = 3
 
 # SPLITS AND MODELS
 train, test = DataUtils.train_test_split(df, horizon)
 
 models = [
-    SimpleMoe(h=horizon, input_size=n_lags, accelerator='mps', max_steps=2500, scaler_type='standard', batch_size=32),
-    # MLP(h=horizon, input_size=n_lags, accelerator='mps', max_steps=1000, scaler_type='standard'),
-    # NHITS(h=horizon, input_size=n_lags, accelerator='mps')
+    SimpleMoe(h=horizon, input_size=n_lags, accelerator='mps',
+              max_steps=2500, scaler_type='standard', batch_size=32,
+              gate='attention', total_loss_type='annealing', sparse_gate=False,
+              add_specialization_loss=False, specialization_factor=.1,
+              annealing_temperature=1000),
+    # SimpleMoe(h=horizon, input_size=n_lags, accelerator='mps',
+    #           max_steps=5000, scaler_type='standard', batch_size=32,
+    #           gate='linear', total_loss_type='annealing', sparse_gate=False,
+    #           add_specialization_loss=False, specialization_factor=.1,
+    #           annealing_temperature=100),
+    MLP(h=horizon, input_size=n_lags, accelerator='mps', max_steps=1000, scaler_type='standard'),
+    NHITS(h=horizon, input_size=n_lags, accelerator='mps')
 ]
-# SimpleMoe    0.953951
-# SimpleMoe    0.936725
-# SimpleMoe    0.935066 attention
-# SimpleMoe    0.938058 rnn
-# SimpleMoe    0.934051 linear
-# MLP          0.983470
+# SimpleMoe     0.934051
+
+# gate='mlp',  # ['mlp','attention','linear','rnn']
+#                  sparse_gate: bool = False,  # [True,False]
+#                  gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','kl']
+#                  add_specialization_loss: bool = False,
+#                  total_loss_type: str = 'annealing',# ['random', 'annealing']
+#
 
 nf = NeuralForecast(models=models, freq=freq_str)
 nf.fit(df=train, val_size=horizon)
