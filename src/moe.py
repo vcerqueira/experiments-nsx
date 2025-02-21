@@ -211,12 +211,6 @@ class SimpleMoe(BaseWindows):
         self.specialization_factor = specialization_factor
         self.annealing_temperature = annealing_temperature
 
-    def get_temperature(self):
-        init_temp = 2.0
-        final_temp = 0.5
-        progress = min(1.0, self.current_step / 1000)  # Anneal over 1000 steps
-        return max(final_temp, init_temp - progress * (init_temp - final_temp))
-
     def forward(self, windows_batch: dict, return_components: bool = False, sparse: bool = False):
         """
         Args:
@@ -309,7 +303,12 @@ class SimpleMoe(BaseWindows):
                 distr_args = self.loss.scale_decouple(output=expert_output, loc=y_loc, scale=y_scale)
                 expert_loss = self.loss(y=original_outsample_y, distr_args=distr_args, mask=outsample_mask)
             else:
-                expert_loss = self.loss(y=outsample_y, y_hat=expert_output, mask=outsample_mask)
+                # expert_loss = self.loss(y=outsample_y, y_hat=expert_output, mask=outsample_mask)
+                try:
+                    expert_loss = self.loss(y=outsample_y, y_hat=expert_output, y_hat_c=output, mask=outsample_mask)
+                except TypeError:
+                    expert_loss = self.loss(y=outsample_y, y_hat=expert_output, mask=outsample_mask)
+
             expert_losses.append(expert_loss)
 
         expert_losses_tensor = torch.stack(expert_losses)  # [num_experts]
