@@ -232,13 +232,69 @@ class SimpleMoe(BaseWindows):
 
         # Compute gate logits and full probabilities
         gate_logits = self.gate(insample_y)
+
         full_gate_weights = self.softmax(gate_logits)  # [batch_size, num_experts]
 
         if sparse_:
             # Get top-k for sparse routing
+
+            # topk_values, topk_indices = torch.topk(gate_logits, k=3, dim=1)
+            # gate_weights = torch.zeros_like(full_gate_weights)
+            # gate_weights.scatter_(1, topk_indices, self.softmax(topk_values))
+
+            gate_weights = self.straight_through_gate(gate_logits)
+        else:
+            gate_weights = full_gate_weights
+
+        if return_components:
+            expert_outputs = torch.zeros(batch_size, len(self.experts), self.h, device=insample_y.device)
+
+            for expert_idx, expert_module in enumerate(self.experts):
+                expert_output = expert_module(windows_batch)
+                expert_outputs[:, expert_idx] = expert_output
+
+            combined_output = (expert_outputs * gate_weights.unsqueeze(-1)).sum(dim=1)
+            return combined_output, expert_outputs, full_gate_weights
+        else:
+            weighted_sum = torch.zeros(batch_size, self.h, device=insample_y.device)
+
+            for expert_idx, expert_module in enumerate(self.experts):
+                expert_output = expert_module(windows_batch)
+                weighted_sum += expert_output * gate_weights[:, expert_idx].unsqueeze(1)
+
+            return weighted_sum
+
+    def forward2(self, windows_batch: dict, return_components: bool = False, sparse: bool = False):
+        """
+        Args:
+            windows_batch (dict): Input batch
+            return_components (bool): If True, returns individual expert outputs and gate weights
+            sparse (bool): If True, uses sparse routing with top-k experts
+        Returns:
+            torch.Tensor if return_components=False: Final weighted predictions
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor] if return_components=True:
+                (combined_output, expert_outputs, gate_weights)
+        """
+        if return_components:
+            sparse_ = False
+        else:
+            sparse_ = self.sparse_gate
+
+        insample_y = windows_batch['insample_y']
+        batch_size = insample_y.size(0)
+
+        # Compute gate logits and full probabilities
+        gate_logits = self.gate(insample_y)
+
+        full_gate_weights = self.softmax(gate_logits)  # [batch_size, num_experts]
+
+        if sparse_:
+            # Get top-k for sparse routing
+
             topk_values, topk_indices = torch.topk(gate_logits, k=3, dim=1)
             gate_weights = torch.zeros_like(full_gate_weights)
             gate_weights.scatter_(1, topk_indices, self.softmax(topk_values))
+
         else:
             gate_weights = full_gate_weights
 
@@ -262,6 +318,29 @@ class SimpleMoe(BaseWindows):
                     weighted_sum += expert_output * gate_weights[:, expert_idx].unsqueeze(1)
 
             return weighted_sum
+
+    def straight_through_gate(self, gate_logits, temperature=1.0, hard=True):
+        """
+        Applies straight-through estimator to gate selections
+        - Forward: Hard selection (one-hot/sparse)
+        - Backward: Gradients as if it was soft selection
+        """
+        # Forward: Get sparse/one-hot
+        gates_soft = F.softmax(gate_logits / temperature, dim=-1)
+
+        if hard:
+            # Straight-through trick
+            gates_hard = F.one_hot(
+                gates_soft.argmax(dim=-1),
+                num_classes=gate_logits.size(-1)
+            ).float()
+
+            # Forward: hard, Backward: soft
+            gates = (gates_hard - gates_soft).detach() + gates_soft
+        else:
+            gates = gates_soft
+
+        return gates
 
     def training_step(self, batch, batch_idx):
         # Create and normalize windows [Ws, L+H, C]
@@ -330,6 +409,39 @@ class SimpleMoe(BaseWindows):
             target_weights = F.softmax(expert_scores / temperature, dim=0)
 
             gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
+        elif self.gate_loss_type == 'ib_softmax_mse_grad':
+            #  gradient trick for gate weights computation
+            temperature=1
+            #
+            # Compute sign of the overall error
+
+            # error_sign = torch.sign(output - outsample_y)  # [batch, horizon]
+            #
+            # # Compute mean error direction per expert across batch
+            # expert_directions = []
+            # for i in range(expert_outputs.size(1)):
+            #     expert_output = expert_outputs[:, i]  # [batch, horizon]
+            #     direction = (error_sign * expert_output).mean()  # Scalar
+            #     expert_directions.append(direction)
+            #
+            # expert_scores = -torch.tensor(expert_directions, device=output.device)  # [num_experts]
+            # target_weights = F.softmax(expert_scores / temperature, dim=0)  # [num_experts]
+
+            # More explicit about what we want
+            # expert_contributions = -(output - outsample_y).unsqueeze(1) * expert_outputs  # Higher is better
+            # WITH gradient trick
+            expert_contributions = -torch.sign(output - outsample_y).unsqueeze(1) * expert_outputs
+
+            expert_scores = expert_contributions.mean(dim=[0, -1])  # Average over batch and horizon
+            target_weights = F.softmax(expert_scores / temperature, dim=0)
+
+            # Expand to match batch size
+            target_weights_expanded = target_weights.unsqueeze(0).expand(gate_weights.size(0), -1)
+
+
+
+            # Compute gate loss
+            gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
         else:
             expert_scores = -expert_losses_tensor  # Convert losses to scores
             target_weights = expert_scores / expert_scores.sum()

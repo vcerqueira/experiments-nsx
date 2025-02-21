@@ -17,13 +17,13 @@ from utils.load_data.config import DATASETS
 
 from src.moe import SimpleMoe
 
-data_name = 'M3'
+data_name = 'M4'
 # data_name = 'Gluonts'
 group = 'Monthly'
 data_loader = DATASETS[data_name]
 min_samples = data_loader.min_samples[group]
 df, horizon, n_lags, freq_str, freq_int = data_loader.load_everything(group, min_n_instances=min_samples)
-df = data_loader.prune_df_by_size(df, min_n_instances=133)
+df = data_loader.prune_df_by_size(df, min_n_instances=500)
 
 print(df['unique_id'].value_counts())
 print(df.shape)
@@ -44,7 +44,7 @@ class MAEGrad(BasePointLoss):
             self,
             y: torch.Tensor,
             y_hat: torch.Tensor,
-            y_hat_c:torch.Tensor = None,
+            y_hat_c: torch.Tensor = None,
             mask: Union[torch.Tensor, None] = None,
     ):
         """
@@ -67,22 +67,26 @@ class MAEGrad(BasePointLoss):
 
 models = [
     SimpleMoe(h=horizon, input_size=n_lags, accelerator='mps',
-              loss=MAEGrad(),
-              # loss=MAE(),
-              max_steps=2500, scaler_type='standard', batch_size=32,
-              gate='attention', total_loss_type='annealing', sparse_gate=False,
+              # loss=MAEGrad(),
+              loss=MAE(),
+              max_steps=2000, scaler_type='standard', batch_size=32,
+              gate='linear', total_loss_type='annealing',
+              gate_loss_type='ib_softmax_mse_grad',
+              sparse_gate=False,
               add_specialization_loss=False, specialization_factor=.1,
               annealing_temperature=1000),
-    # SimpleMoe(h=horizon, input_size=n_lags, accelerator='mps',
-    #           max_steps=5000, scaler_type='standard', batch_size=32,
-    #           gate='linear', total_loss_type='annealing', sparse_gate=False,
-    #           add_specialization_loss=False, specialization_factor=.1,
-    #           annealing_temperature=100),
+    SimpleMoe(h=horizon, input_size=n_lags, accelerator='mps',
+              # loss=MAEGrad(),
+              loss=MAE(),
+              gate_loss_type='ib_softmax_mse',
+              max_steps=2000, scaler_type='standard', batch_size=32,
+              gate='linear', total_loss_type='annealing', sparse_gate=False,
+              add_specialization_loss=False, specialization_factor=.1,
+              annealing_temperature=1000),
     # MLP(h=horizon, input_size=n_lags, accelerator='mps', max_steps=1000, scaler_type='standard'),
     # NHITS(h=horizon, input_size=n_lags, accelerator='mps')
 ]
 # SimpleMoe     0.934051
-# SimpleMoe    0.536232
 
 # gate='mlp',  # ['mlp','attention','linear','rnn']
 #                  sparse_gate: bool = False,  # [True,False]
@@ -101,6 +105,10 @@ evaluation_df = evaluate(test_eval, [partial(mase, seasonality=freq_int)], train
 # evaluation_df = evaluate(test_eval, [smape], train_df=train)
 
 print(evaluation_df.mean(numeric_only=True))
+
+# a=evaluation_df#.mean(numeric_only=True)
+# b=a['SimpleMoe']-a['SimpleMoe1']
+# b.describe()
 
 # import torch
 # a=torch.tensor([0.7701, 0.7661, 0.7785, 0.7845, 0.7890, 0.7772])
