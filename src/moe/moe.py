@@ -9,6 +9,7 @@ from neuralforecast.losses.pytorch import MAE
 from neuralforecast.common._base_windows import BaseWindows
 from neuralforecast.common._modules import MLP as MLPLayer, AttentionLayer
 from neuralforecast.models import MLP as MLP
+from neuralforecast.losses.pytorch import MAE, _weighted_mean, BasePointLoss
 
 
 class RNNGate(nn.Module):
@@ -51,7 +52,39 @@ class AttentionGate(nn.Module):
         return self.out_proj(context)
 
 
-class SimpleMoe(BaseWindows):
+class MAEGrad(BasePointLoss):
+
+    def __init__(self, horizon_weight=None):
+        super(MAEGrad, self).__init__(
+            horizon_weight=horizon_weight, outputsize_multiplier=1, output_names=[""]
+        )
+
+    def __call__(
+            self,
+            y: torch.Tensor,
+            y_hat: torch.Tensor,
+            y_hat_c: torch.Tensor = None,
+            mask: Union[torch.Tensor, None] = None,
+    ):
+        """
+        **Parameters:**<br>
+        `y`: tensor, Actual values.<br>
+        `y_hat`: tensor, Predicted values.<br>
+        `mask`: tensor, Specifies datapoints to consider in loss.<br>
+
+        **Returns:**<br>
+        `mae`: tensor (single value).
+        """
+        # losses = torch.abs(y - y_hat)
+        if y_hat_c is not None:
+            losses = torch.sign(y_hat_c - y) * y_hat
+        else:
+            losses = torch.abs(y - y_hat)
+        weights = self._compute_weights(y=y, mask=mask)
+        return _weighted_mean(losses=losses, weights=weights)
+
+
+class TiMEx(BaseWindows):
     """
     Simple Mixture of Experts (MoE) model for time series forecasting.
     Attributes:
@@ -140,33 +173,33 @@ class SimpleMoe(BaseWindows):
                  annealing_temperature: int = 1000,
                  **trainer_kwargs):
 
-        super(SimpleMoe, self).__init__(h=h,
-                                        input_size=input_size,
-                                        stat_exog_list=None,
-                                        futr_exog_list=None,
-                                        hist_exog_list=None,
-                                        loss=loss,
-                                        valid_loss=valid_loss,
-                                        max_steps=max_steps,
-                                        learning_rate=learning_rate,
-                                        num_lr_decays=num_lr_decays,
-                                        early_stop_patience_steps=early_stop_patience_steps,
-                                        val_check_steps=val_check_steps,
-                                        batch_size=batch_size,
-                                        valid_batch_size=valid_batch_size,
-                                        windows_batch_size=windows_batch_size,
-                                        inference_windows_batch_size=inference_windows_batch_size,
-                                        start_padding_enabled=start_padding_enabled,
-                                        step_size=step_size,
-                                        scaler_type=scaler_type,
-                                        random_seed=random_seed,
-                                        drop_last_loader=drop_last_loader,
-                                        optimizer=optimizer,
-                                        optimizer_kwargs=optimizer_kwargs,
-                                        lr_scheduler=lr_scheduler,
-                                        lr_scheduler_kwargs=lr_scheduler_kwargs,
-                                        dataloader_kwargs=dataloader_kwargs,
-                                        **trainer_kwargs)
+        super(TiMEx, self).__init__(h=h,
+                                    input_size=input_size,
+                                    stat_exog_list=None,
+                                    futr_exog_list=None,
+                                    hist_exog_list=None,
+                                    loss=loss,
+                                    valid_loss=valid_loss,
+                                    max_steps=max_steps,
+                                    learning_rate=learning_rate,
+                                    num_lr_decays=num_lr_decays,
+                                    early_stop_patience_steps=early_stop_patience_steps,
+                                    val_check_steps=val_check_steps,
+                                    batch_size=batch_size,
+                                    valid_batch_size=valid_batch_size,
+                                    windows_batch_size=windows_batch_size,
+                                    inference_windows_batch_size=inference_windows_batch_size,
+                                    start_padding_enabled=start_padding_enabled,
+                                    step_size=step_size,
+                                    scaler_type=scaler_type,
+                                    random_seed=random_seed,
+                                    drop_last_loader=drop_last_loader,
+                                    optimizer=optimizer,
+                                    optimizer_kwargs=optimizer_kwargs,
+                                    #lr_scheduler=lr_scheduler,
+                                    #lr_scheduler_kwargs=lr_scheduler_kwargs,
+                                    #dataloader_kwargs=dataloader_kwargs,
+                                    **trainer_kwargs)
 
         self.input_size = input_size
         self.h = h
@@ -411,7 +444,7 @@ class SimpleMoe(BaseWindows):
             gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
         elif self.gate_loss_type == 'ib_softmax_mse_grad':
             #  gradient trick for gate weights computation
-            temperature=1
+            temperature = 1
             #
             # Compute sign of the overall error
 
@@ -437,8 +470,6 @@ class SimpleMoe(BaseWindows):
 
             # Expand to match batch size
             target_weights_expanded = target_weights.unsqueeze(0).expand(gate_weights.size(0), -1)
-
-
 
             # Compute gate loss
             gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
