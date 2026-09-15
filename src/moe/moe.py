@@ -104,6 +104,12 @@ class NSX(BaseModel):
                  gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','kl']
                  add_specialization_loss: bool = False,
                  specialization_factor: float = 0.2,
+                 add_ncl_loss: bool = False,
+                 ncl_factor: float = 0.1,
+                 add_balance_loss: bool = False,
+                 balance_factor: float = 0.01,
+                 include_combined_loss: bool = False,
+                 anneal_temperature: bool = False,
                  total_loss_type: str = 'annealing',  # ['random', 'annealing','sumsqr']
                  annealing_temperature: int = 1000,
                  **trainer_kwargs):
@@ -183,10 +189,16 @@ class NSX(BaseModel):
         else:
             raise ValueError(f"Unknown pooling={pooling!r}; expected 'dense', 'sparse', 'soft', or 'ste'")
         self.add_specialization_loss = add_specialization_loss
+        self.specialization_factor = specialization_factor
+        self.add_ncl_loss = add_ncl_loss
+        self.ncl_factor = ncl_factor
+        self.add_balance_loss = add_balance_loss
+        self.balance_factor = balance_factor
+        self.include_combined_loss = include_combined_loss
+        self.anneal_temperature = anneal_temperature
 
         self.gate_loss_type = gate_loss_type
         self.total_loss_type = total_loss_type
-        self.specialization_factor = specialization_factor
         self.annealing_temperature = annealing_temperature
 
     def forward(self, windows_batch: dict, return_components: bool = False):
@@ -277,9 +289,10 @@ class NSX(BaseModel):
         expert_losses_tensor = torch.stack(expert_losses)  # [num_experts]
         expert_loss = expert_losses_tensor.mean()
 
+        temperature = self.get_temperature() if self.anneal_temperature else 1
+
         if self.gate_loss_type == 'ib_softmax_mse':
             # Softmax-based weighting
-            temperature = 1
             expert_scores = -expert_losses_tensor  # Convert losses to scores
             target_weights = F.softmax(expert_scores / temperature, dim=0)
 
@@ -288,15 +301,12 @@ class NSX(BaseModel):
             # Compute per-instance gate loss
             gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
         elif self.gate_loss_type == 'softmax_mse':
-            temperature = 1
             expert_scores = -expert_losses_tensor  # Convert losses to scores
             target_weights = F.softmax(expert_scores / temperature, dim=0)
 
             gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
         elif self.gate_loss_type == 'ib_softmax_mse_grad':
             #  gradient trick for gate weights computation
-            temperature = 1
-            #
             # Compute sign of the overall error
 
             # error_sign = torch.sign(output - outsample_y)  # [batch, horizon]
@@ -361,6 +371,19 @@ class NSX(BaseModel):
             spec_loss = self.specialization_loss(expert_outputs, gate_weights)
             total_loss += self.specialization_factor * spec_loss  # Small weight for specialization
 
+        if self.add_ncl_loss:
+            ncl = self.ncl_loss(expert_outputs)
+            total_loss += self.ncl_factor * ncl
+            self.log("ncl_loss", ncl.detach(), batch_size=outsample_y.size(0), on_epoch=True)
+
+        if self.add_balance_loss:
+            bal = self.balance_loss(gate_weights)
+            total_loss += self.balance_factor * bal
+            self.log("balance_loss", bal.detach(), batch_size=outsample_y.size(0), on_epoch=True)
+
+        if self.include_combined_loss:
+            total_loss = total_loss + combined_loss
+
         # Log all components
         self.log("combined_loss", combined_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
         self.log("expert_loss", expert_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
@@ -389,6 +412,35 @@ class NSX(BaseModel):
 
         self.current_step += 1
         return total_loss
+
+    def get_temperature(self):
+        init_temp = 2.0
+        final_temp = 0.5
+        progress = min(1.0, self.current_step / self.annealing_temperature)
+        return max(final_temp, init_temp - progress * (init_temp - final_temp))
+
+    def ncl_loss(self, expert_outputs):
+        """Negative correlation learning: penalize experts that co-vary with the ensemble."""
+        num_experts = expert_outputs.size(1)
+        ensemble_mean = expert_outputs.mean(dim=1, keepdim=True)
+
+        ncl_terms = []
+        for i in range(num_experts):
+            expert_pred = expert_outputs[:, i:i + 1]
+            others = torch.cat([expert_outputs[:, :i], expert_outputs[:, i + 1:]], dim=1)
+            others_mean = others.mean(dim=1, keepdim=True)
+            correlation = ((expert_pred - ensemble_mean) * (others_mean - ensemble_mean)).mean()
+            ncl_terms.append(correlation)
+
+        return torch.stack(ncl_terms).mean()
+
+    def balance_loss(self, gate_weights):
+        """KL of mean gate usage toward uniform, minus entropy so the gate does not collapse."""
+        expert_usage = gate_weights.mean(0)
+        target_usage = torch.ones_like(expert_usage) / gate_weights.size(1)
+        kl = F.kl_div(expert_usage.log(), target_usage, reduction='batchmean')
+        entropy = -(gate_weights * torch.log(gate_weights + 1e-10)).sum(1).mean()
+        return kl - 0.1 * entropy
 
     def specialization_loss(self, expert_outputs, gate_weights):
         """
