@@ -6,87 +6,20 @@ import torch.nn.functional as F
 import numpy as np
 import math
 from neuralforecast.losses.pytorch import MAE
-from neuralforecast.common._base_windows import BaseWindows
+from neuralforecast.common._base_model import BaseModel
 from neuralforecast.common._modules import MLP as MLPLayer, AttentionLayer
 from neuralforecast.models import MLP as MLP
 from neuralforecast.losses.pytorch import MAE, _weighted_mean, BasePointLoss
 
-
-class RNNGate(nn.Module):
-    def __init__(self, input_size, num_experts, hidden_size=32):
-        super().__init__()
-        self.gru = nn.GRU(
-            input_size=1,  # Process one timestep at a time
-            hidden_size=hidden_size,
-            batch_first=True
-        )
-        self.proj = nn.Linear(hidden_size, num_experts)
-
-    def forward(self, x):
-        # x shape: [batch_size, seq_length]
-        x = x.unsqueeze(-1)  # Add feature dim: [batch, seq, 1]
-        _, h_n = self.gru(x)  # h_n shape: [1, batch, hidden]
-        return self.proj(h_n.squeeze(0))  # [batch, num_experts]
+from src.moe.gates import RNNGate, AttentionGate
+from src.moe.losses import MAEGrad
+from src.moe.pooling import DensePooling, SparsePooling, SoftPooling, StraightThroughPooling
 
 
-class AttentionGate(nn.Module):
-    def __init__(self, input_size, num_experts, hidden_size=32):
-        super().__init__()
-        self.query = nn.Parameter(torch.randn(hidden_size))
-        self.key_proj = nn.Linear(1, hidden_size)
-        self.value_proj = nn.Linear(1, hidden_size)
-        self.out_proj = nn.Linear(hidden_size, num_experts)
-
-    def forward(self, x):
-        # x shape: [batch_size, seq_length]
-        x = x.unsqueeze(-1)  # [batch, seq, 1]
-        keys = self.key_proj(x)  # [batch, seq, hidden]
-        values = self.value_proj(x)  # [batch, seq, hidden]
-
-        # Compute attention scores
-        scores = torch.matmul(keys, self.query) / math.sqrt(keys.size(-1))
-        attn_weights = F.softmax(scores, dim=1)  # [batch, seq]
-
-        # Weighted sum of values
-        context = torch.bmm(attn_weights.unsqueeze(1), values).squeeze(1)
-        return self.out_proj(context)
-
-
-class MAEGrad(BasePointLoss):
-
-    def __init__(self, horizon_weight=None):
-        super(MAEGrad, self).__init__(
-            horizon_weight=horizon_weight, outputsize_multiplier=1, output_names=[""]
-        )
-
-    def __call__(
-            self,
-            y: torch.Tensor,
-            y_hat: torch.Tensor,
-            y_hat_c: torch.Tensor = None,
-            mask: Union[torch.Tensor, None] = None,
-    ):
-        """
-        **Parameters:**<br>
-        `y`: tensor, Actual values.<br>
-        `y_hat`: tensor, Predicted values.<br>
-        `mask`: tensor, Specifies datapoints to consider in loss.<br>
-
-        **Returns:**<br>
-        `mae`: tensor (single value).
-        """
-        # losses = torch.abs(y - y_hat)
-        if y_hat_c is not None:
-            losses = torch.sign(y_hat_c - y) * y_hat
-        else:
-            losses = torch.abs(y - y_hat)
-        weights = self._compute_weights(y=y, mask=mask)
-        return _weighted_mean(losses=losses, weights=weights)
-
-
-class TiMEx(BaseWindows):
+class NSX(BaseModel):
     """
-    Simple Mixture of Experts (MoE) model for time series forecasting.
+    Neural-based time-Series mixture of eXperts
+
     Attributes:
         SAMPLING_TYPE (str): Type of sampling used, default is 'univariate'.
         EXOGENOUS_FUTR (bool): Indicates if future exogenous variables are used, default is False.
@@ -165,7 +98,9 @@ class TiMEx(BaseWindows):
                  dataloader_kwargs=None,
                  experts=None,
                  gate='mlp',  # ['mlp','attention','linear','rnn']
-                 sparse_gate: bool = False,  # [True,False]
+                 pooling: str = 'dense',  # ['dense','sparse','soft','ste']
+                 k: int = 3,  # Number of top experts for sparse pooling
+                 temperature: float = 1.0,  # Temperature for soft pooling
                  gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','kl']
                  add_specialization_loss: bool = False,
                  specialization_factor: float = 0.2,
@@ -173,33 +108,33 @@ class TiMEx(BaseWindows):
                  annealing_temperature: int = 1000,
                  **trainer_kwargs):
 
-        super(TiMEx, self).__init__(h=h,
-                                    input_size=input_size,
-                                    stat_exog_list=None,
-                                    futr_exog_list=None,
-                                    hist_exog_list=None,
-                                    loss=loss,
-                                    valid_loss=valid_loss,
-                                    max_steps=max_steps,
-                                    learning_rate=learning_rate,
-                                    num_lr_decays=num_lr_decays,
-                                    early_stop_patience_steps=early_stop_patience_steps,
-                                    val_check_steps=val_check_steps,
-                                    batch_size=batch_size,
-                                    valid_batch_size=valid_batch_size,
-                                    windows_batch_size=windows_batch_size,
-                                    inference_windows_batch_size=inference_windows_batch_size,
-                                    start_padding_enabled=start_padding_enabled,
-                                    step_size=step_size,
-                                    scaler_type=scaler_type,
-                                    random_seed=random_seed,
-                                    drop_last_loader=drop_last_loader,
-                                    optimizer=optimizer,
-                                    optimizer_kwargs=optimizer_kwargs,
-                                    #lr_scheduler=lr_scheduler,
-                                    #lr_scheduler_kwargs=lr_scheduler_kwargs,
-                                    #dataloader_kwargs=dataloader_kwargs,
-                                    **trainer_kwargs)
+        super(NSX, self).__init__(h=h,
+                                  input_size=input_size,
+                                  stat_exog_list=None,
+                                  futr_exog_list=None,
+                                  hist_exog_list=None,
+                                  loss=loss,
+                                  valid_loss=valid_loss,
+                                  max_steps=max_steps,
+                                  learning_rate=learning_rate,
+                                  num_lr_decays=num_lr_decays,
+                                  early_stop_patience_steps=early_stop_patience_steps,
+                                  val_check_steps=val_check_steps,
+                                  batch_size=batch_size,
+                                  valid_batch_size=valid_batch_size,
+                                  windows_batch_size=windows_batch_size,
+                                  inference_windows_batch_size=inference_windows_batch_size,
+                                  start_padding_enabled=start_padding_enabled,
+                                  step_size=step_size,
+                                  scaler_type=scaler_type,
+                                  random_seed=random_seed,
+                                  drop_last_loader=drop_last_loader,
+                                  optimizer=optimizer,
+                                  optimizer_kwargs=optimizer_kwargs,
+                                  # lr_scheduler=lr_scheduler,
+                                  # lr_scheduler_kwargs=lr_scheduler_kwargs,
+                                  # dataloader_kwargs=dataloader_kwargs,
+                                  **trainer_kwargs)
 
         self.input_size = input_size
         self.h = h
@@ -235,8 +170,18 @@ class TiMEx(BaseWindows):
             self.gate = RNNGate(input_size=self.input_size, num_experts=self.num_experts, )
 
         self.softmax = nn.Softmax(dim=1)
-        self.k = 3
-        self.sparse_gate = sparse_gate
+        self.k = k
+        self.temperature = temperature
+        if pooling == 'dense':
+            self.pooling = DensePooling()
+        elif pooling == 'sparse':
+            self.pooling = SparsePooling(k=k)
+        elif pooling == 'soft':
+            self.pooling = SoftPooling(temperature=temperature)
+        elif pooling == 'ste':
+            self.pooling = StraightThroughPooling()
+        else:
+            raise ValueError(f"Unknown pooling={pooling!r}; expected 'dense', 'sparse', 'soft', or 'ste'")
         self.add_specialization_loss = add_specialization_loss
 
         self.gate_loss_type = gate_loss_type
@@ -244,40 +189,24 @@ class TiMEx(BaseWindows):
         self.specialization_factor = specialization_factor
         self.annealing_temperature = annealing_temperature
 
-    def forward(self, windows_batch: dict, return_components: bool = False, sparse: bool = False):
+    def forward(self, windows_batch: dict, return_components: bool = False):
         """
         Args:
             windows_batch (dict): Input batch
             return_components (bool): If True, returns individual expert outputs and gate weights
-            sparse (bool): If True, uses sparse routing with top-k experts
         Returns:
             torch.Tensor if return_components=False: Final weighted predictions
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor] if return_components=True:
-                (combined_output, expert_outputs, gate_weights)
+                (combined_output, expert_outputs, full_gate_weights)
         """
-        if return_components:
-            sparse_ = False
-        else:
-            sparse_ = self.sparse_gate
-
         insample_y = windows_batch['insample_y']
         batch_size = insample_y.size(0)
 
-        # Compute gate logits and full probabilities
         gate_logits = self.gate(insample_y)
-
         full_gate_weights = self.softmax(gate_logits)  # [batch_size, num_experts]
-
-        if sparse_:
-            # Get top-k for sparse routing
-
-            # topk_values, topk_indices = torch.topk(gate_logits, k=3, dim=1)
-            # gate_weights = torch.zeros_like(full_gate_weights)
-            # gate_weights.scatter_(1, topk_indices, self.softmax(topk_values))
-
-            gate_weights = self.straight_through_gate(gate_logits)
-        else:
-            gate_weights = full_gate_weights
+        # Training (return_components) always mixes densely so every expert gets a
+        # gradient. Sparse / STE / temperature pooling is inference-only.
+        gate_weights = full_gate_weights if return_components else self.pooling(gate_logits)
 
         if return_components:
             expert_outputs = torch.zeros(batch_size, len(self.experts), self.h, device=insample_y.device)
@@ -296,84 +225,6 @@ class TiMEx(BaseWindows):
                 weighted_sum += expert_output * gate_weights[:, expert_idx].unsqueeze(1)
 
             return weighted_sum
-
-    def forward2(self, windows_batch: dict, return_components: bool = False, sparse: bool = False):
-        """
-        Args:
-            windows_batch (dict): Input batch
-            return_components (bool): If True, returns individual expert outputs and gate weights
-            sparse (bool): If True, uses sparse routing with top-k experts
-        Returns:
-            torch.Tensor if return_components=False: Final weighted predictions
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor] if return_components=True:
-                (combined_output, expert_outputs, gate_weights)
-        """
-        if return_components:
-            sparse_ = False
-        else:
-            sparse_ = self.sparse_gate
-
-        insample_y = windows_batch['insample_y']
-        batch_size = insample_y.size(0)
-
-        # Compute gate logits and full probabilities
-        gate_logits = self.gate(insample_y)
-
-        full_gate_weights = self.softmax(gate_logits)  # [batch_size, num_experts]
-
-        if sparse_:
-            # Get top-k for sparse routing
-
-            topk_values, topk_indices = torch.topk(gate_logits, k=3, dim=1)
-            gate_weights = torch.zeros_like(full_gate_weights)
-            gate_weights.scatter_(1, topk_indices, self.softmax(topk_values))
-
-        else:
-            gate_weights = full_gate_weights
-
-        if return_components:
-            expert_outputs = torch.zeros(batch_size, len(self.experts), self.h, device=insample_y.device)
-
-            for expert_idx, expert_module in enumerate(self.experts):
-                if not sparse_ or (sparse_ and (topk_indices == expert_idx).any()):
-                    expert_output = expert_module(windows_batch)
-                    expert_outputs[:, expert_idx] = expert_output
-
-            combined_output = (expert_outputs * gate_weights.unsqueeze(-1)).sum(dim=1)
-            return combined_output, expert_outputs, full_gate_weights
-
-        else:
-            weighted_sum = torch.zeros(batch_size, self.h, device=insample_y.device)
-
-            for expert_idx, expert_module in enumerate(self.experts):
-                if not sparse_ or (sparse_ and (topk_indices == expert_idx).any()):
-                    expert_output = expert_module(windows_batch)
-                    weighted_sum += expert_output * gate_weights[:, expert_idx].unsqueeze(1)
-
-            return weighted_sum
-
-    def straight_through_gate(self, gate_logits, temperature=1.0, hard=True):
-        """
-        Applies straight-through estimator to gate selections
-        - Forward: Hard selection (one-hot/sparse)
-        - Backward: Gradients as if it was soft selection
-        """
-        # Forward: Get sparse/one-hot
-        gates_soft = F.softmax(gate_logits / temperature, dim=-1)
-
-        if hard:
-            # Straight-through trick
-            gates_hard = F.one_hot(
-                gates_soft.argmax(dim=-1),
-                num_classes=gate_logits.size(-1)
-            ).float()
-
-            # Forward: hard, Backward: soft
-            gates = (gates_hard - gates_soft).detach() + gates_soft
-        else:
-            gates = gates_soft
-
-        return gates
 
     def training_step(self, batch, batch_idx):
         # Create and normalize windows [Ws, L+H, C]
@@ -402,7 +253,7 @@ class TiMEx(BaseWindows):
         )
 
         # Get predictions and component analysis
-        output, expert_outputs, gate_weights = self(windows_batch, return_components=True, sparse=False)
+        output, expert_outputs, gate_weights = self(windows_batch, return_components=True)
 
         # Compute individual expert losses
         expert_losses = []

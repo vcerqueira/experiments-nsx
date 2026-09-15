@@ -1,0 +1,13 @@
+[project]
+name = "experiments-nsx"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets==4.8.4",
+    "datasetsforecast==1.0.1",
+    "matplotlib==3.10.8",
+    "neuralforecast==3.2.0",
+    "numpy==2.4.4",
+    "pandas==2.3.3",
+    "python-dotenv==1.2.2",
+]

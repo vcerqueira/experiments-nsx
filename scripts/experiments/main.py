@@ -43,7 +43,7 @@ models = [
           gate='linear',
           total_loss_type='annealing',
           gate_loss_type='ib_softmax_mse_grad',
-          sparse_gate=False,
+          pooling='dense',
           add_specialization_loss=False,
           specialization_factor=.1,
           annealing_temperature=1000),
@@ -57,7 +57,7 @@ models = [
           batch_size=32,
           gate='linear',
           total_loss_type='annealing',
-          sparse_gate=False,
+          pooling='dense',
           add_specialization_loss=False,
           specialization_factor=.1,
           annealing_temperature=1000),
@@ -71,7 +71,7 @@ models = [
 # SimpleMoe     0.934051
 
 # gate='mlp',  # ['mlp','attention','linear','rnn']
-#                  sparse_gate: bool = False,  # [True,False]
+#                  pooling: str = 'dense',  # ['dense','sparse','soft','ste']
 #                  gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','kl']
 #                  add_specialization_loss: bool = False,
 #                  total_loss_type: str = 'annealing',# ['random', 'annealing']

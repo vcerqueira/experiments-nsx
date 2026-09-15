@@ -33,8 +33,8 @@ models = []
 # for gate_ in ['mlp', 'attention', 'linear', 'rnn']:
 for gate_ in ['attention']:
 
-    # for sparse_gate_ in [True, False]:
-    for sparse_gate_ in [True]:
+    # for pooling_ in ['dense', 'sparse', 'soft', 'ste']:
+    for pooling_ in ['ste']:
 
         # for gate_loss_type_ in ['ib_softmax_mse', 'softmax_mse', 'minmax_mse']:
         for gate_loss_type_ in ['ib_softmax_mse']:
@@ -50,7 +50,7 @@ for gate_ in ['attention']:
                                 batch_size=32)
 
                     pars = {'gate': gate_,
-                            'sparse_gate': sparse_gate_,
+                            'pooling': pooling_,
                             'gate_loss_type': gate_loss_type_,
                             'add_specialization_loss': add_spec,
                             'total_loss_type': total_loss_type_}

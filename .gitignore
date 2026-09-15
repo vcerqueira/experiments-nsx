@@ -166,3 +166,5 @@ lightning_logs/
 # Custom
 scripts/_dev/
 assets/datasets
+.DS_Store
+assets/
