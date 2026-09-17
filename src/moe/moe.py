@@ -8,12 +8,42 @@ import math
 from neuralforecast.losses.pytorch import MAE
 from neuralforecast.common._base_model import BaseModel
 from neuralforecast.common._modules import MLP as MLPLayer, AttentionLayer
-from neuralforecast.models import MLP as MLP
+from neuralforecast.models import MLP, KAN, NBEATS
 from neuralforecast.losses.pytorch import MAE, _weighted_mean, BasePointLoss
 
 from src.moe.gates import RNNGate, AttentionGate
 from src.moe.losses import MAEGrad
 from src.moe.pooling import DensePooling, SparsePooling, SoftPooling, StraightThroughPooling
+
+EXPERT_REGISTRY = {
+    "mlp": MLP,
+    "kan": KAN,
+    "nbeats": NBEATS,
+}
+
+
+def _expert_init_kwargs(expert_arch, h, expert_kwargs):
+    kwargs = dict(expert_kwargs or {})
+    if expert_arch == "nbeats" and h == 1:
+        kwargs.setdefault("stack_types", ["identity"])
+        kwargs.setdefault("n_blocks", [1])
+        kwargs.setdefault("mlp_units", [[512, 512]])
+    return kwargs
+
+
+def _build_experts(h, input_size, num_experts, expert_arch, expert_kwargs):
+    if expert_arch not in EXPERT_REGISTRY:
+        raise ValueError(
+            f"Unknown expert_arch={expert_arch!r}; expected one of {sorted(EXPERT_REGISTRY)}"
+        )
+    if num_experts < 1:
+        raise ValueError(f"num_experts must be >= 1, got {num_experts}")
+    cls = EXPERT_REGISTRY[expert_arch]
+    kwargs = _expert_init_kwargs(expert_arch, h, expert_kwargs)
+    return nn.ModuleList([
+        cls(h=h, input_size=input_size, random_seed=random.randint(1, 1000), **kwargs)
+        for _ in range(num_experts)
+    ])
 
 
 class NSX(BaseModel):
@@ -97,6 +127,9 @@ class NSX(BaseModel):
                  lr_scheduler_kwargs=None,
                  dataloader_kwargs=None,
                  experts=None,
+                 num_experts: int = 6,
+                 expert_arch: str = 'mlp',  # ['mlp','kan','nbeats']
+                 expert_kwargs=None,
                  gate='mlp',  # ['mlp','attention','linear','rnn']
                  pooling: str = 'dense',  # ['dense','sparse','soft','ste']
                  k: int = 3,  # Number of top experts for sparse pooling
@@ -146,16 +179,15 @@ class NSX(BaseModel):
         self.h = h
 
         if experts is not None:
-            self.experts = experts
+            self.experts = experts if isinstance(experts, nn.ModuleList) else nn.ModuleList(experts)
         else:
-            self.experts = nn.ModuleList([
-                MLP(h=self.h, input_size=self.input_size, random_seed=random.randint(1, 1000)),
-                MLP(h=self.h, input_size=self.input_size, random_seed=random.randint(1, 1000)),
-                MLP(h=self.h, input_size=self.input_size, random_seed=random.randint(1, 1000)),
-                MLP(h=self.h, input_size=self.input_size, random_seed=random.randint(1, 1000)),
-                MLP(h=self.h, input_size=self.input_size, random_seed=random.randint(1, 1000)),
-                MLP(h=self.h, input_size=self.input_size, random_seed=random.randint(1, 1000)),
-            ])
+            self.experts = _build_experts(
+                h=self.h,
+                input_size=self.input_size,
+                num_experts=num_experts,
+                expert_arch=expert_arch,
+                expert_kwargs=expert_kwargs,
+            )
 
         self.num_experts = len(self.experts)
         self.current_step = 0
@@ -176,6 +208,7 @@ class NSX(BaseModel):
             self.gate = RNNGate(input_size=self.input_size, num_experts=self.num_experts, )
 
         self.softmax = nn.Softmax(dim=1)
+        k = min(k, self.num_experts)
         self.k = k
         self.temperature = temperature
         if pooling == 'dense':
@@ -211,38 +244,36 @@ class NSX(BaseModel):
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor] if return_components=True:
                 (combined_output, expert_outputs, full_gate_weights)
         """
-        insample_y = windows_batch['insample_y']
-        batch_size = insample_y.size(0)
-
-        gate_logits = self.gate(insample_y)
-        full_gate_weights = self.softmax(gate_logits)  # [batch_size, num_experts]
+        insample_y = windows_batch['insample_y']  # [B, L] or [B, L, 1]
+        gate_logits = self.gate(insample_y.squeeze(-1))
+        full_gate_weights = self.softmax(gate_logits)  # [B, num_experts]
         # Training (return_components) always mixes densely so every expert gets a
         # gradient. Sparse / STE / temperature pooling is inference-only.
         gate_weights = full_gate_weights if return_components else self.pooling(gate_logits)
 
+        expert_outputs = []
+        for expert_module in self.experts:
+            expert_output = expert_module(windows_batch)
+            if expert_output.ndim == 3:
+                expert_output = expert_output.squeeze(-1)
+            expert_outputs.append(expert_output)
+        expert_outputs = torch.stack(expert_outputs, dim=1)  # [B, E, h]
+
+        combined_output = (expert_outputs * gate_weights.unsqueeze(-1)).sum(dim=1)
+        combined_output = combined_output.unsqueeze(-1)  # [B, h, 1] for NeuralForecast
+
         if return_components:
-            expert_outputs = torch.zeros(batch_size, len(self.experts), self.h, device=insample_y.device)
-
-            for expert_idx, expert_module in enumerate(self.experts):
-                expert_output = expert_module(windows_batch)
-                expert_outputs[:, expert_idx] = expert_output
-
-            combined_output = (expert_outputs * gate_weights.unsqueeze(-1)).sum(dim=1)
             return combined_output, expert_outputs, full_gate_weights
-        else:
-            weighted_sum = torch.zeros(batch_size, self.h, device=insample_y.device)
-
-            for expert_idx, expert_module in enumerate(self.experts):
-                expert_output = expert_module(windows_batch)
-                weighted_sum += expert_output * gate_weights[:, expert_idx].unsqueeze(1)
-
-            return weighted_sum
+        return combined_output
 
     def training_step(self, batch, batch_idx):
-        # Create and normalize windows [Ws, L+H, C]
-        windows = self._create_windows(batch, step="train")
         y_idx = batch["y_idx"]
-        original_outsample_y = torch.clone(windows["temporal"][:, -self.h:, y_idx])
+        temporal_cols = batch["temporal_cols"]
+        windows_temporal, static, static_cols = self._create_windows(batch, step="train")
+        windows = self._sample_windows(
+            windows_temporal, static, static_cols, temporal_cols, step="train"
+        )
+        original_outsample_y = torch.clone(windows["temporal"][:, self.input_size:, y_idx])
         windows = self._normalization(windows=windows, y_idx=y_idx)
 
         # Parse windows
@@ -270,15 +301,12 @@ class NSX(BaseModel):
         # Compute individual expert losses
         expert_losses = []
         for i in range(expert_outputs.size(1)):  # Loop through each expert
-            expert_output = expert_outputs[:, i]
+            expert_output = expert_outputs[:, i].unsqueeze(-1)
             if self.loss.is_distribution_output:
-                _, y_loc, y_scale = self._inv_normalization(
-                    y_hat=outsample_y, temporal_cols=batch["temporal_cols"], y_idx=y_idx
-                )
+                y_loc, y_scale = self._get_loc_scale(y_idx)
                 distr_args = self.loss.scale_decouple(output=expert_output, loc=y_loc, scale=y_scale)
                 expert_loss = self.loss(y=original_outsample_y, distr_args=distr_args, mask=outsample_mask)
             else:
-                # expert_loss = self.loss(y=outsample_y, y_hat=expert_output, mask=outsample_mask)
                 try:
                     expert_loss = self.loss(y=outsample_y, y_hat=expert_output, y_hat_c=output, mask=outsample_mask)
                 except TypeError:
@@ -324,7 +352,10 @@ class NSX(BaseModel):
             # More explicit about what we want
             # expert_contributions = -(output - outsample_y).unsqueeze(1) * expert_outputs  # Higher is better
             # WITH gradient trick
-            expert_contributions = -torch.sign(output - outsample_y).unsqueeze(1) * expert_outputs
+            expert_contributions = (
+                -torch.sign(output.squeeze(-1) - outsample_y.squeeze(-1)).unsqueeze(1)
+                * expert_outputs
+            )
 
             expert_scores = expert_contributions.mean(dim=[0, -1])  # Average over batch and horizon
             target_weights = F.softmax(expert_scores / temperature, dim=0)
@@ -345,9 +376,7 @@ class NSX(BaseModel):
 
         # Compute combined loss
         if self.loss.is_distribution_output:
-            _, y_loc, y_scale = self._inv_normalization(
-                y_hat=outsample_y, temporal_cols=batch["temporal_cols"], y_idx=y_idx
-            )
+            y_loc, y_scale = self._get_loc_scale(y_idx)
             distr_args = self.loss.scale_decouple(output=output, loc=y_loc, scale=y_scale)
             combined_loss = self.loss(y=original_outsample_y, distr_args=distr_args, mask=outsample_mask)
         else:
