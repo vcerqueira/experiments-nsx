@@ -6,7 +6,7 @@ import pandas as pd
 from datasetsforecast.long_horizon import LongHorizon
 from dotenv import load_dotenv
 
-from src.loaders.base import DatasetLoader
+from loaders.base import DatasetLoader
 
 
 # load_dotenv()

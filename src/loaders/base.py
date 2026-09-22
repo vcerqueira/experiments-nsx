@@ -67,16 +67,6 @@ class DatasetLoader:
         return df
 
     @staticmethod
-    def sample_uids(df: pd.DataFrame, frac_uid: float, id_col: str = 'unique_id'):
-
-        unique_ids = pd.Series(df[id_col].unique())
-        sampled_ids = unique_ids.sample(frac=frac_uid, random_state=123)
-
-        sampled_df = df[df['unique_id'].isin(sampled_ids)].reset_index(drop=True)
-
-        return sampled_df
-
-    @staticmethod
     def dummify_series(df, id_col: str = 'unique_id', target_col: str = 'y'):
         df_uid = df.copy().groupby(id_col)
 
@@ -99,6 +89,19 @@ class DatasetLoader:
         tail_df = pd.concat(df_list, axis=0).reset_index(drop=True)
 
         return tail_df
+
+    @staticmethod
+    def remove_uids_with_nas(df: pd.DataFrame,
+                             id_col: str = 'unique_id',
+                             target_col: str = 'y') -> pd.DataFrame:
+        """
+        Removes any unique_id groups where the target column contains one or more NA values.
+        """
+        bad_ids = df.loc[df[target_col].isna(), id_col].unique()
+
+        filtered_df = df[~df[id_col].isin(bad_ids)].reset_index(drop=True)
+
+        return filtered_df
 
     @staticmethod
     def time_wise_split(df: pd.DataFrame,

@@ -8,7 +8,7 @@ from neuralforecast.losses.pytorch import MAE
 from neuralforecast.losses.numpy import mase
 from neuralforecast.models import MLP, NHITS
 from utilsforecast.evaluation import evaluate
-from modelradar.evaluate.radar import ModelRadar
+from metaforecast.evaluation import ModelRadar
 
 from src.loaders import ChronosDataset, LongHorizonDatasetR
 from src.moe.moe import NSX

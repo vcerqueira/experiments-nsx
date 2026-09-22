@@ -97,14 +97,17 @@ class NSX(BaseModel):
     EXOGENOUS_FUTR = False
     EXOGENOUS_HIST = False
     EXOGENOUS_STAT = False
+    EXOGENOUS_CAT = False
+    MULTIVARIATE = False
+    RECURRENT = False
 
     def __init__(self,
                  h,
                  input_size,
                  dropout: float = 0.1,
+                 stat_exog_list=None,
                  futr_exog_list=None,
                  hist_exog_list=None,
-                 stat_exog_list=None,
                  loss=MAE(),
                  valid_loss=None,
                  max_steps: int = 4000,
@@ -149,9 +152,9 @@ class NSX(BaseModel):
 
         super(NSX, self).__init__(h=h,
                                   input_size=input_size,
-                                  stat_exog_list=None,
-                                  futr_exog_list=None,
-                                  hist_exog_list=None,
+                                  stat_exog_list=stat_exog_list,
+                                  futr_exog_list=futr_exog_list,
+                                  hist_exog_list=hist_exog_list,
                                   loss=loss,
                                   valid_loss=valid_loss,
                                   max_steps=max_steps,
@@ -170,9 +173,9 @@ class NSX(BaseModel):
                                   drop_last_loader=drop_last_loader,
                                   optimizer=optimizer,
                                   optimizer_kwargs=optimizer_kwargs,
-                                  # lr_scheduler=lr_scheduler,
-                                  # lr_scheduler_kwargs=lr_scheduler_kwargs,
-                                  # dataloader_kwargs=dataloader_kwargs,
+                                  lr_scheduler=lr_scheduler,
+                                  lr_scheduler_kwargs=lr_scheduler_kwargs,
+                                  dataloader_kwargs=dataloader_kwargs,
                                   **trainer_kwargs)
 
         self.input_size = input_size
@@ -267,11 +270,42 @@ class NSX(BaseModel):
         return combined_output
 
     def training_step(self, batch, batch_idx):
+        if self.RECURRENT:
+            self.h = self.h_train
+
         y_idx = batch["y_idx"]
-        temporal_cols = batch["temporal_cols"]
-        windows_temporal, static, static_cols = self._create_windows(batch, step="train")
+        (
+            windows_temporal,
+            static,
+            static_cols,
+            final_condition,
+            sample_weight_windows,
+            temporal_cols,
+        ) = self._create_windows(batch, step="train")
+        final_condition = self._shard_multivariate_windows(final_condition)
+        n_windows = len(final_condition)
+        if self.windows_batch_size is not None:
+            if n_windows < self.windows_batch_size:
+                w_idxs = torch.randint(
+                    0,
+                    n_windows,
+                    size=(self.windows_batch_size,),
+                    device=windows_temporal.device,
+                )
+            else:
+                w_idxs = torch.randperm(n_windows, device=windows_temporal.device)[
+                    : self.windows_batch_size
+                ]
+        else:
+            w_idxs = torch.arange(n_windows, device=windows_temporal.device)
         windows = self._sample_windows(
-            windows_temporal, static, static_cols, temporal_cols, step="train"
+            windows_temporal=windows_temporal,
+            static=static,
+            static_cols=static_cols,
+            temporal_cols=temporal_cols,
+            w_idxs=w_idxs,
+            final_condition=final_condition,
+            sample_weight=sample_weight_windows,
         )
         original_outsample_y = torch.clone(windows["temporal"][:, self.input_size:, y_idx])
         windows = self._normalization(windows=windows, y_idx=y_idx)
@@ -287,6 +321,10 @@ class NSX(BaseModel):
             stat_exog,
         ) = self._parse_windows(batch, windows)
 
+        sample_weight = windows.get("sample_weight", None)
+        if sample_weight is not None:
+            outsample_mask = outsample_mask * sample_weight
+
         windows_batch = dict(
             insample_y=insample_y,
             insample_mask=insample_mask,
@@ -297,20 +335,24 @@ class NSX(BaseModel):
 
         # Get predictions and component analysis
         output, expert_outputs, gate_weights = self(windows_batch, return_components=True)
+        output = self.loss.domain_map(output)
 
         # Compute individual expert losses
         expert_losses = []
         for i in range(expert_outputs.size(1)):  # Loop through each expert
-            expert_output = expert_outputs[:, i].unsqueeze(-1)
+            expert_output = self.loss.domain_map(expert_outputs[:, i].unsqueeze(-1))
             if self.loss.is_distribution_output:
                 y_loc, y_scale = self._get_loc_scale(y_idx)
                 distr_args = self.loss.scale_decouple(output=expert_output, loc=y_loc, scale=y_scale)
                 expert_loss = self.loss(y=original_outsample_y, distr_args=distr_args, mask=outsample_mask)
             else:
-                try:
-                    expert_loss = self.loss(y=outsample_y, y_hat=expert_output, y_hat_c=output, mask=outsample_mask)
-                except TypeError:
-                    expert_loss = self.loss(y=outsample_y, y_hat=expert_output, mask=outsample_mask)
+                expert_loss = self._point_loss(
+                    y=outsample_y,
+                    y_hat=expert_output,
+                    mask=outsample_mask,
+                    insample_y=insample_y,
+                    y_hat_c=output,
+                )
 
             expert_losses.append(expert_loss)
 
@@ -377,10 +419,16 @@ class NSX(BaseModel):
         # Compute combined loss
         if self.loss.is_distribution_output:
             y_loc, y_scale = self._get_loc_scale(y_idx)
+            outsample_y = original_outsample_y
             distr_args = self.loss.scale_decouple(output=output, loc=y_loc, scale=y_scale)
-            combined_loss = self.loss(y=original_outsample_y, distr_args=distr_args, mask=outsample_mask)
+            combined_loss = self.loss(y=outsample_y, distr_args=distr_args, mask=outsample_mask)
         else:
-            combined_loss = self.loss(y=outsample_y, y_hat=output, mask=outsample_mask)
+            combined_loss = self._point_loss(
+                y=outsample_y,
+                y_hat=output,
+                mask=outsample_mask,
+                insample_y=insample_y,
+            )
 
         if self.total_loss_type == 'random':
             p = np.random.random()
@@ -427,20 +475,33 @@ class NSX(BaseModel):
             print("Model Parameters", self.hparams)
             print("insample_y", torch.isnan(insample_y).sum())
             print("outsample_y", torch.isnan(outsample_y).sum())
-            print("output", torch.isnan(output).sum())
             raise Exception("Loss is NaN, training stopped.")
 
+        train_loss_log = total_loss.detach().item()
         self.log(
             "train_loss",
-            total_loss.detach().item(),
+            train_loss_log,
             batch_size=outsample_y.size(0),
             prog_bar=True,
             on_epoch=True,
         )
-        self.train_trajectories.append((self.global_step, total_loss.detach().item()))
+        self.train_trajectories.append((self.global_step, train_loss_log))
 
         self.current_step += 1
+        self.h = self.horizon_backup
         return total_loss
+
+    def _point_loss(self, y, y_hat, mask, insample_y, y_hat_c=None):
+        kwargs = dict(y=y, y_hat=y_hat, mask=mask, y_insample=insample_y)
+        if y_hat_c is not None:
+            try:
+                return self.loss(**kwargs, y_hat_c=y_hat_c)
+            except TypeError:
+                pass
+        try:
+            return self.loss(**kwargs)
+        except TypeError:
+            return self.loss(y=y, y_hat=y_hat, mask=mask)
 
     def get_temperature(self):
         init_temp = 2.0

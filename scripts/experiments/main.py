@@ -5,10 +5,10 @@ from pathlib import Path
 
 from neuralforecast import NeuralForecast
 from neuralforecast.losses.pytorch import MAE
-from neuralforecast.losses.numpy import mase
 from neuralforecast.models import MLP, NHITS
 from utilsforecast.evaluation import evaluate
-from modelradar.evaluate.radar import ModelRadar
+from utilsforecast.losses import mase
+from metaforecast.evaluation import ModelRadar
 
 from src.loaders import ChronosDataset, LongHorizonDatasetR
 from src.moe.moe import NSX
@@ -30,7 +30,7 @@ models = [
     NSX(h=horizon,
         input_size=input_size,
         accelerator='cpu',
-        max_steps=20,
+        max_steps=10,
         scaler_type='standard',
         batch_size=32,
         gate='linear',
@@ -54,15 +54,13 @@ print(fcst)
 
 cv = test.merge(fcst, on=['unique_id', 'ds'], how="left")
 
-# fazer com o metaforecast...
 radar_outer = ModelRadar(
     cv_df=cv,
     metrics=[partial(mase, seasonality=seas_len)],
-    model_names=['NSX','MLP'],
     train_df=train,
     hardness_reference='MLP',
     ratios_reference='MLP',
 )
 
-err_outer = radar_outer.evaluate(keep_uids=False)
+err_outer = radar_outer.evaluate()
 print(err_outer)
