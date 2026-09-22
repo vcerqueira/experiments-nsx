@@ -43,9 +43,9 @@ if __name__ == '__main__':
 
         cfg_id = config_sample.pop('config_id')
 
-        # check if no of configs reaches MAX_SAMPLES
+        # Count every finished config for this target, not this config id alone.
         config_pattern = f"NSX,{cfg_id},{target}"
-        config_files = list(RESULTS_PATH.glob(f"{config_pattern}.csv"))
+        config_files = list(RESULTS_PATH.glob(f"NSX,*,{target}.csv"))
         n_configs = len(config_files)
         if n_configs >= MAX_SAMPLES:
             print(f"No of configs reached MAX_SAMPLES for {target}")

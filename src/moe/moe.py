@@ -137,7 +137,9 @@ class NSX(BaseModel):
                  pooling: str = 'dense',  # ['dense','sparse','soft','ste']
                  k: int = 3,  # Number of top experts for sparse pooling
                  temperature: float = 1.0,  # Temperature for soft pooling
-                 gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','kl']
+                 gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','ib_softmax_mse_grad','kl']
+                 detach_gate_targets: bool = True,
+                 scale_maeg_by_gate: bool = True,
                  add_specialization_loss: bool = False,
                  specialization_factor: float = 0.2,
                  add_ncl_loss: bool = False,
@@ -232,6 +234,8 @@ class NSX(BaseModel):
         self.balance_factor = balance_factor
         self.include_combined_loss = include_combined_loss
         self.anneal_temperature = anneal_temperature
+        self.detach_gate_targets = detach_gate_targets
+        self.scale_maeg_by_gate = scale_maeg_by_gate
 
         self.gate_loss_type = gate_loss_type
         self.total_loss_type = total_loss_type
@@ -337,34 +341,47 @@ class NSX(BaseModel):
         output, expert_outputs, gate_weights = self(windows_batch, return_components=True)
         output = self.loss.domain_map(output)
 
-        # Compute individual expert losses
+        # Compute individual expert losses. Gate targets stay on the unweighted
+        # term so scale_maeg_by_gate only changes the expert objective.
         expert_losses = []
+        gate_expert_losses = []
         for i in range(expert_outputs.size(1)):  # Loop through each expert
             expert_output = self.loss.domain_map(expert_outputs[:, i].unsqueeze(-1))
             if self.loss.is_distribution_output:
                 y_loc, y_scale = self._get_loc_scale(y_idx)
                 distr_args = self.loss.scale_decouple(output=expert_output, loc=y_loc, scale=y_scale)
                 expert_loss = self.loss(y=original_outsample_y, distr_args=distr_args, mask=outsample_mask)
+                gate_expert_loss = expert_loss
             else:
-                expert_loss = self._point_loss(
+                point_kwargs = dict(
                     y=outsample_y,
                     y_hat=expert_output,
                     mask=outsample_mask,
                     insample_y=insample_y,
                     y_hat_c=output,
                 )
+                gate_expert_loss = self._point_loss(**point_kwargs)
+                if self.scale_maeg_by_gate:
+                    # Detach so this flag only rescales the expert gradient.
+                    expert_loss = self._point_loss(
+                        **point_kwargs,
+                        gate_weight=gate_weights[:, i].detach(),
+                    )
+                else:
+                    expert_loss = gate_expert_loss
 
             expert_losses.append(expert_loss)
+            gate_expert_losses.append(gate_expert_loss)
 
-        expert_losses_tensor = torch.stack(expert_losses)  # [num_experts]
-        expert_loss = expert_losses_tensor.mean()
+        expert_losses_tensor = torch.stack(gate_expert_losses)  # [num_experts]
+        expert_loss = torch.stack(expert_losses).mean()
 
         temperature = self.get_temperature() if self.anneal_temperature else 1
 
         if self.gate_loss_type == 'ib_softmax_mse':
             # Softmax-based weighting
             expert_scores = -expert_losses_tensor  # Convert losses to scores
-            target_weights = F.softmax(expert_scores / temperature, dim=0)
+            target_weights = self._gate_target(F.softmax(expert_scores / temperature, dim=0))
 
             target_weights_expanded = target_weights.unsqueeze(0).expand(gate_weights.size(0), -1)
 
@@ -372,7 +389,7 @@ class NSX(BaseModel):
             gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
         elif self.gate_loss_type == 'softmax_mse':
             expert_scores = -expert_losses_tensor  # Convert losses to scores
-            target_weights = F.softmax(expert_scores / temperature, dim=0)
+            target_weights = self._gate_target(F.softmax(expert_scores / temperature, dim=0))
 
             gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
         elif self.gate_loss_type == 'ib_softmax_mse_grad':
@@ -400,7 +417,7 @@ class NSX(BaseModel):
             )
 
             expert_scores = expert_contributions.mean(dim=[0, -1])  # Average over batch and horizon
-            target_weights = F.softmax(expert_scores / temperature, dim=0)
+            target_weights = self._gate_target(F.softmax(expert_scores / temperature, dim=0))
 
             # Expand to match batch size
             target_weights_expanded = target_weights.unsqueeze(0).expand(gate_weights.size(0), -1)
@@ -408,13 +425,10 @@ class NSX(BaseModel):
             # Compute gate loss
             gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
         else:
-            expert_scores = -expert_losses_tensor  # Convert losses to scores
-            target_weights = expert_scores / expert_scores.sum()
-            # target_weights = expert_scores / expert_scores.sum(dim=0)
-            # target_weights_expanded = target_weights.unsqueeze(0).expand(gate_weights.size(0), -1)
-
+            # "kl" and any other name: rank experts by softmax(-loss).
+            expert_scores = -expert_losses_tensor
+            target_weights = self._gate_target(F.softmax(expert_scores / temperature, dim=0))
             gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
-            # gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
 
         # Compute combined loss
         if self.loss.is_distribution_output:
@@ -491,11 +505,19 @@ class NSX(BaseModel):
         self.h = self.horizon_backup
         return total_loss
 
-    def _point_loss(self, y, y_hat, mask, insample_y, y_hat_c=None):
+    def _gate_target(self, target_weights):
+        if self.detach_gate_targets:
+            return target_weights.detach()
+        return target_weights
+
+    def _point_loss(self, y, y_hat, mask, insample_y, y_hat_c=None, gate_weight=None):
         kwargs = dict(y=y, y_hat=y_hat, mask=mask, y_insample=insample_y)
         if y_hat_c is not None:
+            extra = {"y_hat_c": y_hat_c}
+            if gate_weight is not None:
+                extra["gate_weight"] = gate_weight
             try:
-                return self.loss(**kwargs, y_hat_c=y_hat_c)
+                return self.loss(**kwargs, **extra)
             except TypeError:
                 pass
         try:

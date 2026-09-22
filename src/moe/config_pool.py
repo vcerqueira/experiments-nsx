@@ -26,11 +26,13 @@ CONFIG_POOL = {
         "temperature": tune.loguniform(0.1, 5.0),
 
         # --- NSX gate / total loss ---
-        # implemented: ib_softmax_mse, softmax_mse, ib_softmax_mse_grad;
-        # anything else (including "kl") hits the else branch
+        # kl uses softmax(-expert_loss), same ranking as softmax_mse
         "gate_loss_type": tune.choice(
             ["ib_softmax_mse", "softmax_mse", "ib_softmax_mse_grad", "kl"]
         ),
+        "detach_gate_targets": tune.choice([True, False]),
+        # scales the MAEGrad expert term by that expert's gate weight
+        "scale_maeg_by_gate": tune.choice([True, False]),
         # implemented: "random", "annealing", "sum" (comment says "sumsqr")
         "total_loss_type": tune.choice(["random", "annealing", "sum"]),
         "include_combined_loss": tune.choice([True, False]),
