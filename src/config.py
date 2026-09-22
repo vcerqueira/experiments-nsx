@@ -12,8 +12,9 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y"}
 
 
-DRY_RUN = False
+DRY_RUN = True
 
+MAX_SAMPLES = 1000
 SEED = 123
 USE_MPS = _env_bool("USE_MPS", True)
 USE_CUDA = _env_bool("USE_CUDA", False)

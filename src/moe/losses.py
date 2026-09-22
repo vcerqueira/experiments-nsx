@@ -15,19 +15,22 @@ class MAEGrad(BasePointLoss):
             self,
             y: torch.Tensor,
             y_hat: torch.Tensor,
-            y_hat_c: torch.Tensor = None,
             mask: Union[torch.Tensor, None] = None,
-    ):
+            y_insample: Union[torch.Tensor, None] = None,
+            y_hat_c: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         **Parameters:**<br>
         `y`: tensor, Actual values.<br>
         `y_hat`: tensor, Predicted values.<br>
         `mask`: tensor, Specifies datapoints to consider in loss.<br>
+        `y_insample`: tensor, Actual insample values. Accepted for neuralforecast
+        compatibility and unused in this loss.<br>
+        `y_hat_c`: tensor, Combined prediction used for the signed gradient.<br>
 
         **Returns:**<br>
         `mae`: tensor (single value).
         """
-        # losses = torch.abs(y - y_hat)
         if y_hat_c is not None:
             losses = torch.sign(y_hat_c - y) * y_hat
         else:

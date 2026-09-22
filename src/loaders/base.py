@@ -108,7 +108,7 @@ class DatasetLoader:
                         horizon: int,
                         id_col: str = 'unique_id',
                         time_col: str = 'ds'):
-        df_by_unq = df.groupby(id_col)
+        df_by_unq = df.copy().groupby(id_col)
 
         train_l, test_l = [], []
         for g, df_ in df_by_unq:

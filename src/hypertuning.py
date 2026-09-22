@@ -1,11 +1,14 @@
 import random
 import hashlib
+import copy
 import json
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
+from neuralforecast.losses.pytorch import MAE
 
+from src.moe.losses import MAEGrad
 from src.config import SEED, N_SAMPLES
 from src.moe.moe import NSX
 
@@ -65,13 +68,17 @@ class ConfigSampler:
         return config_id
 
     @staticmethod
-    def create_model_instance(model_class: str,
-                              model_config: Dict,
+    def create_model_instance(model_config: Dict,
                               horizon: int,
                               input_size: int,
                               engine: str,
                               limit_epochs: bool = False,
                               limit_val_batches: Optional[int] = None):
+
+        model_config = copy.deepcopy(model_config)
+
+        if 'config_id' in model_config:
+            config_id = model_config.pop('config_id')
 
         input_multiplier = model_config.pop('input_size_multiplier')
 
@@ -82,6 +89,10 @@ class ConfigSampler:
         if 'inference_input_size_multiplier' in model_config:
             inference_input_size_multiplier = model_config.pop('inference_input_size_multiplier')
             base_config['inference_input_size'] = input_size * inference_input_size_multiplier
+
+        loss_type = model_config.pop('loss')
+        loss = MAE() if loss_type == 'mae' else MAEGrad()
+        model_config['loss'] = loss
 
         config = {**model_config, **base_config}
 

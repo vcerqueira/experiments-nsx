@@ -1,15 +1,11 @@
 from ray import tune
-from neuralforecast.losses.pytorch import MAE
-
-from src.moe.losses import MAEGrad
-
 
 CONFIG_POOL = {
     "NSX": {
         # --- shared NeuralForecast training knobs (MLP-style) ---
         "input_size_multiplier": tune.choice([1, 2, 3]),
-        "dropout": tune.choice([0.0, 0.1, 0.2, 0.3]),
-        "loss": tune.choice([MAE(), MAEGrad()]),
+        # "dropout": tune.choice([0.0, 0.1, 0.2, 0.3]),
+        "loss": tune.choice(['mae', 'maeg']),
         "learning_rate": tune.loguniform(1e-4, 1e-1),
         "scaler_type": tune.choice(["identity", "robust", "standard"]),
         "max_steps": tune.choice([500, 1000, 2000]),
