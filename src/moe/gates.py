@@ -4,21 +4,21 @@ import torch.nn.functional as F
 import math
 
 
-class RNNGate(nn.Module):
-    def __init__(self, input_size, num_experts, hidden_size=32):
-        super().__init__()
-        self.gru = nn.GRU(
-            input_size=1,  # Process one timestep at a time
-            hidden_size=hidden_size,
-            batch_first=True
-        )
-        self.proj = nn.Linear(hidden_size, num_experts)
-
-    def forward(self, x):
-        # x shape: [batch_size, seq_length]
-        x = x.unsqueeze(-1)  # Add feature dim: [batch, seq, 1]
-        _, h_n = self.gru(x)  # h_n shape: [1, batch, hidden]
-        return self.proj(h_n.squeeze(0))  # [batch, num_experts]
+# class RNNGate(nn.Module):
+#     def __init__(self, input_size, num_experts, hidden_size=32):
+#         super().__init__()
+#         self.gru = nn.GRU(
+#             input_size=1,  # Process one timestep at a time
+#             hidden_size=hidden_size,
+#             batch_first=True
+#         )
+#         self.proj = nn.Linear(hidden_size, num_experts)
+#
+#     def forward(self, x):
+#         # x shape: [batch_size, seq_length]
+#         x = x.unsqueeze(-1)  # Add feature dim: [batch, seq, 1]
+#         _, h_n = self.gru(x)  # h_n shape: [1, batch, hidden]
+#         return self.proj(h_n.squeeze(0))  # [batch, num_experts]
 
 
 class AttentionGate(nn.Module):

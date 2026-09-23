@@ -11,8 +11,7 @@ from neuralforecast.common._modules import MLP as MLPLayer, AttentionLayer
 from neuralforecast.models import MLP, KAN, NBEATS
 from neuralforecast.losses.pytorch import MAE, _weighted_mean, BasePointLoss
 
-from src.moe.gates import RNNGate, AttentionGate
-from src.moe.losses import MAEGrad
+from src.moe.gates import AttentionGate
 from src.moe.pooling import DensePooling, SparsePooling, SoftPooling, StraightThroughPooling
 
 EXPERT_REGISTRY = {
@@ -215,7 +214,8 @@ class NSX(BaseModel):
         elif gate == 'linear':
             self.gate = nn.Linear(self.input_size, self.num_experts, bias=False)
         else:
-            self.gate = RNNGate(input_size=self.input_size, num_experts=self.num_experts, )
+            # self.gate = RNNGate(input_size=self.input_size, num_experts=self.num_experts, )
+            raise ValueError(f"Unknown gate={gate!r}")
 
         self.softmax = nn.Softmax(dim=1)
         k = min(k, self.num_experts)
