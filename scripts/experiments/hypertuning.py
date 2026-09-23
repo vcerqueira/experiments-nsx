@@ -3,6 +3,8 @@ import warnings
 from functools import partial
 from pathlib import Path
 
+import pandas as pd
+
 from neuralforecast import NeuralForecast
 
 from src.loaders import ChronosDataset, LongHorizonDatasetR
@@ -26,7 +28,7 @@ df, horizon, n_lags, freq, seas_len = ChronosDataset.load_everything(target, min
 
 CV_SETUP = {'val_size': horizon, 'test_size': horizon, 'step_size': 1, 'n_windows': None, }
 
-RESULTS_PATH = Path('../assets/results')
+RESULTS_PATH = Path('../../assets/results')
 
 if __name__ == '__main__':
     print(RESULTS_PATH.absolute())
@@ -64,16 +66,23 @@ if __name__ == '__main__':
                                                     engine=ENGINE,
                                                     limit_epochs=LIMIT_EPOCHS)
 
-        nf = NeuralForecast(models=[model], freq=freq)
-        cv = nf.cross_validation(df=df, **CV_SETUP)
+        try:
+            nf = NeuralForecast(models=[model], freq=freq)
+            cv = nf.cross_validation(df=df, **CV_SETUP)
 
-        radar_outer = ModelRadar(
-            cv_df=cv,
-            metrics=[partial(mase, seasonality=seas_len)],
-            train_df=train,
-        )
+            radar_outer = ModelRadar(
+                cv_df=cv,
+                metrics=[partial(mase, seasonality=seas_len)],
+                train_df=train,
+            )
 
-        err_outer = radar_outer.evaluate()
+            err_outer = radar_outer.evaluate()
+        except Exception as e:
+            if "Loss is NaN, training stopped." not in str(e):
+                raise
+            print(f"Loss is NaN on {target},{cfg_id}")
+            err_outer = pd.Series([float("nan")], name="Overall")
+
         print(err_outer)
 
         err_outer.to_csv(fp, index=False)

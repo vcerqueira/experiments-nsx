@@ -24,10 +24,15 @@ EXPERT_REGISTRY = {
 
 def _expert_init_kwargs(expert_arch, h, expert_kwargs):
     kwargs = dict(expert_kwargs or {})
-    if expert_arch == "nbeats" and h == 1:
+    if expert_arch == "nbeats":
         kwargs.setdefault("stack_types", ["identity"])
         kwargs.setdefault("n_blocks", [1])
-        kwargs.setdefault("mlp_units", [[512, 512]])
+        kwargs.setdefault("mlp_units", [[128, 128]])
+    elif expert_arch == "kan":
+        kwargs.setdefault("hidden_size", 64)
+    elif expert_arch == "mlp":
+        kwargs.setdefault("hidden_size", 64)
+
     return kwargs
 
 
