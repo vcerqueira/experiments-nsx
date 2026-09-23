@@ -307,6 +307,7 @@ class NSX(BaseModel):
                 ]
         else:
             w_idxs = torch.arange(n_windows, device=windows_temporal.device)
+
         windows = self._sample_windows(
             windows_temporal=windows_temporal,
             static=static,

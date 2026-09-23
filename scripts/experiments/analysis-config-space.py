@@ -29,8 +29,12 @@ scores = pd.concat(rows, ignore_index=True)
 results = scores.merge(configs.reset_index(), on='config_id', how='left')
 
 results.set_index('config_id', inplace=True)
+
+
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
+
+
 results['Overall'].describe()
 results['Overall'].isna().mean()
 
@@ -40,8 +44,10 @@ results.groupby('scaler_type').median(numeric_only=True)
 results.groupby('max_steps').median(numeric_only=True)
 results.groupby('start_padding_enabled').median(numeric_only=True)
 results.groupby('num_experts').median(numeric_only=True)
-results.groupby('gate').median(numeric_only=True)
-results.groupby('pooling').mean(numeric_only=True)
+print(results.groupby('gate').median(numeric_only=True)['Overall'])
+print(results.groupby('gate').mean(numeric_only=True)['Overall'])
+print(results.groupby('pooling').mean(numeric_only=True)['Overall'])
+results.groupby('pooling').median(numeric_only=True)
 results.groupby('gate_loss_type').median(numeric_only=True)
 results.groupby('detach_gate_targets').mean(numeric_only=True)
 results.groupby('scale_maeg_by_gate').mean(numeric_only=True)
