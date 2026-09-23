@@ -29,6 +29,8 @@ scores = pd.concat(rows, ignore_index=True)
 results = scores.merge(configs.reset_index(), on='config_id', how='left')
 
 results.set_index('config_id', inplace=True)
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', None)
 results['Overall'].describe()
 results['Overall'].isna().mean()
 
