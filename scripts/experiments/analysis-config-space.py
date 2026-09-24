@@ -39,23 +39,17 @@ results['Overall'].describe()
 results['Overall'].isna().mean()
 
 
-results.groupby('loss').median(numeric_only=True)
 results.groupby('scaler_type').median(numeric_only=True)
 results.groupby('max_steps').median(numeric_only=True)
-results.groupby('start_padding_enabled').median(numeric_only=True)
 results.groupby('num_experts').median(numeric_only=True)
 print(results.groupby('gate').median(numeric_only=True)['Overall'])
 print(results.groupby('gate').mean(numeric_only=True)['Overall'])
 print(results.groupby('pooling').mean(numeric_only=True)['Overall'])
+print(results.groupby('pooling').mean(numeric_only=True)['Overall'])
 results.groupby('pooling').median(numeric_only=True)
 results.groupby('gate_loss_type').median(numeric_only=True)
-results.groupby('detach_gate_targets').mean(numeric_only=True)
-results.groupby('scale_maeg_by_gate').mean(numeric_only=True)
 results.groupby('total_loss_type').median(numeric_only=True)
-results.groupby('include_combined_loss').median(numeric_only=True)
 results.groupby('anneal_temperature').median(numeric_only=True)
-results.groupby('add_specialization_loss').median(numeric_only=True)
-results.groupby('add_ncl_loss').median(numeric_only=True)
 results.groupby('add_balance_loss').median(numeric_only=True)
 
 
@@ -82,3 +76,34 @@ for column in results.columns.drop('Overall'):
 nan_rates = pd.concat(nan_rates, ignore_index=True).sort_values('lift', ascending=False)
 
 print(results)
+
+
+def _levels(series, max_levels=25):
+    if series.nunique(dropna=False) <= max_levels:
+        return series
+    return pd.qcut(series, q=4, duplicates='drop')
+
+
+effects = []
+global_median = results['Overall'].median()
+for column in results.columns.drop('Overall'):
+    level = _levels(results[column])
+    for value, score in results.groupby(level, dropna=False, observed=False)['Overall']:
+        finite = score.dropna()
+        effects.append({
+            'parameter': column,
+            'value': value,
+            'n': int(score.size),
+            'n_nan': int(score.isna().sum()),
+            'nan_rate': score.isna().mean(),
+            'median': finite.median(),
+            'p25': finite.quantile(0.25),
+            'p75': finite.quantile(0.75),
+            'median_vs_global': finite.median() - global_median,
+        })
+
+effects = pd.DataFrame(effects)
+gap = effects.groupby('parameter')['median'].agg(lambda s: s.max() - s.min())
+effects = effects.join(gap.rename('gap'), on='parameter')
+effects = effects.sort_values(['gap', 'parameter', 'median'], ascending=[False, True, True])
+print(effects.drop(columns='gap').to_string(index=False))

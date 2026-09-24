@@ -34,22 +34,22 @@ class SoftPooling(nn.Module):
     def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
         return F.softmax(gate_logits / self.temperature, dim=1)
 
-
-class StraightThroughPooling(nn.Module):
-    """Hard one-hot in the forward pass, softmax gradients in the backward pass."""
-
-    def __init__(self, temperature: float = 1.0, hard: bool = True):
-        super().__init__()
-        self.temperature = temperature
-        self.hard = hard
-
-    def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
-        gates_soft = F.softmax(gate_logits / self.temperature, dim=-1)
-        if not self.hard:
-            return gates_soft
-
-        gates_hard = F.one_hot(
-            gates_soft.argmax(dim=-1),
-            num_classes=gate_logits.size(-1),
-        ).float()
-        return (gates_hard - gates_soft).detach() + gates_soft
+#
+# class StraightThroughPooling(nn.Module):
+#     """Hard one-hot in the forward pass, softmax gradients in the backward pass."""
+#
+#     def __init__(self, temperature: float = 1.0, hard: bool = True):
+#         super().__init__()
+#         self.temperature = temperature
+#         self.hard = hard
+#
+#     def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
+#         gates_soft = F.softmax(gate_logits / self.temperature, dim=-1)
+#         if not self.hard:
+#             return gates_soft
+#
+#         gates_hard = F.one_hot(
+#             gates_soft.argmax(dim=-1),
+#             num_classes=gate_logits.size(-1),
+#         ).float()
+#         return (gates_hard - gates_soft).detach() + gates_soft

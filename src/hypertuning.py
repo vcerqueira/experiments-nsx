@@ -6,9 +6,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from neuralforecast.losses.pytorch import MAE
 
-# from src.moe.losses import MAEGrad
 from src.config import SEED, N_SAMPLES
 from src.moe.moe import NSX
 
@@ -89,11 +87,6 @@ class ConfigSampler:
         if 'inference_input_size_multiplier' in model_config:
             inference_input_size_multiplier = model_config.pop('inference_input_size_multiplier')
             base_config['inference_input_size'] = input_size * inference_input_size_multiplier
-
-        loss_type = model_config.pop('loss')
-        # todo fix this properly
-        loss = MAE() if loss_type == 'mae' else MAE()
-        model_config['loss'] = loss
 
         config = {**model_config, **base_config}
 

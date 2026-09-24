@@ -1,18 +1,15 @@
-from typing import Tuple, Union
 import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
 from neuralforecast.losses.pytorch import MAE
 from neuralforecast.common._base_model import BaseModel
-from neuralforecast.common._modules import MLP as MLPLayer, AttentionLayer
+from neuralforecast.common._modules import MLP as MLPLayer
 from neuralforecast.models import MLP, KAN, NBEATS
-from neuralforecast.losses.pytorch import MAE, _weighted_mean, BasePointLoss
 
 from src.moe.gates import AttentionGate
-from src.moe.pooling import DensePooling, SparsePooling, SoftPooling, StraightThroughPooling
+from src.moe.pooling import DensePooling, SparsePooling, SoftPooling
 
 EXPERT_REGISTRY = {
     "mlp": MLP,
@@ -137,20 +134,13 @@ class NSX(BaseModel):
                  num_experts: int = 6,
                  expert_arch: str = 'mlp',  # ['mlp','kan','nbeats']
                  expert_kwargs=None,
-                 gate='mlp',  # ['mlp','attention','linear','rnn']
+                 gate='mlp',  # ['mlp','attention','linear']
                  pooling: str = 'dense',  # ['dense','sparse','soft','ste']
                  k: int = 3,  # Number of top experts for sparse pooling
                  temperature: float = 1.0,  # Temperature for soft pooling
                  gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','ib_softmax_mse_grad','kl']
-                 detach_gate_targets: bool = True,
-                 scale_maeg_by_gate: bool = True,
-                 add_specialization_loss: bool = False,
-                 specialization_factor: float = 0.2,
-                 add_ncl_loss: bool = False,
-                 ncl_factor: float = 0.1,
                  add_balance_loss: bool = False,
                  balance_factor: float = 0.01,
-                 include_combined_loss: bool = False,
                  anneal_temperature: bool = False,
                  total_loss_type: str = 'annealing',  # ['random', 'annealing','sumsqr']
                  annealing_temperature: int = 1000,
@@ -214,7 +204,6 @@ class NSX(BaseModel):
         elif gate == 'linear':
             self.gate = nn.Linear(self.input_size, self.num_experts, bias=False)
         else:
-            # self.gate = RNNGate(input_size=self.input_size, num_experts=self.num_experts, )
             raise ValueError(f"Unknown gate={gate!r}")
 
         self.softmax = nn.Softmax(dim=1)
@@ -227,20 +216,11 @@ class NSX(BaseModel):
             self.pooling = SparsePooling(k=k)
         elif pooling == 'soft':
             self.pooling = SoftPooling(temperature=temperature)
-        elif pooling == 'ste':
-            self.pooling = StraightThroughPooling()
         else:
-            raise ValueError(f"Unknown pooling={pooling!r}; expected 'dense', 'sparse', 'soft', or 'ste'")
-        self.add_specialization_loss = add_specialization_loss
-        self.specialization_factor = specialization_factor
-        self.add_ncl_loss = add_ncl_loss
-        self.ncl_factor = ncl_factor
+            raise ValueError(f"Unknown pooling={pooling!r}; expected 'dense', 'sparse', or 'soft'")
         self.add_balance_loss = add_balance_loss
         self.balance_factor = balance_factor
-        self.include_combined_loss = include_combined_loss
         self.anneal_temperature = anneal_temperature
-        self.detach_gate_targets = detach_gate_targets
-        self.scale_maeg_by_gate = scale_maeg_by_gate
 
         self.gate_loss_type = gate_loss_type
         self.total_loss_type = total_loss_type
@@ -347,40 +327,24 @@ class NSX(BaseModel):
         output, expert_outputs, gate_weights = self(windows_batch, return_components=True)
         output = self.loss.domain_map(output)
 
-        # Compute individual expert losses. Gate targets stay on the unweighted
-        # term so scale_maeg_by_gate only changes the expert objective.
         expert_losses = []
-        gate_expert_losses = []
-        for i in range(expert_outputs.size(1)):  # Loop through each expert
+        for i in range(expert_outputs.size(1)):
             expert_output = self.loss.domain_map(expert_outputs[:, i].unsqueeze(-1))
             if self.loss.is_distribution_output:
                 y_loc, y_scale = self._get_loc_scale(y_idx)
                 distr_args = self.loss.scale_decouple(output=expert_output, loc=y_loc, scale=y_scale)
                 expert_loss = self.loss(y=original_outsample_y, distr_args=distr_args, mask=outsample_mask)
-                gate_expert_loss = expert_loss
             else:
-                point_kwargs = dict(
+                expert_loss = self._point_loss(
                     y=outsample_y,
                     y_hat=expert_output,
                     mask=outsample_mask,
                     insample_y=insample_y,
-                    y_hat_c=output,
                 )
-                gate_expert_loss = self._point_loss(**point_kwargs)
-                if self.scale_maeg_by_gate:
-                    # Detach so this flag only rescales the expert gradient.
-                    expert_loss = self._point_loss(
-                        **point_kwargs,
-                        gate_weight=gate_weights[:, i].detach(),
-                    )
-                else:
-                    expert_loss = gate_expert_loss
-
             expert_losses.append(expert_loss)
-            gate_expert_losses.append(gate_expert_loss)
 
-        expert_losses_tensor = torch.stack(gate_expert_losses)  # [num_experts]
-        expert_loss = torch.stack(expert_losses).mean()
+        expert_losses_tensor = torch.stack(expert_losses)
+        expert_loss = expert_losses_tensor.mean()
 
         temperature = self.get_temperature() if self.anneal_temperature else 1
 
@@ -399,24 +363,6 @@ class NSX(BaseModel):
 
             gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
         elif self.gate_loss_type == 'ib_softmax_mse_grad':
-            #  gradient trick for gate weights computation
-            # Compute sign of the overall error
-
-            # error_sign = torch.sign(output - outsample_y)  # [batch, horizon]
-            #
-            # # Compute mean error direction per expert across batch
-            # expert_directions = []
-            # for i in range(expert_outputs.size(1)):
-            #     expert_output = expert_outputs[:, i]  # [batch, horizon]
-            #     direction = (error_sign * expert_output).mean()  # Scalar
-            #     expert_directions.append(direction)
-            #
-            # expert_scores = -torch.tensor(expert_directions, device=output.device)  # [num_experts]
-            # target_weights = F.softmax(expert_scores / temperature, dim=0)  # [num_experts]
-
-            # More explicit about what we want
-            # expert_contributions = -(output - outsample_y).unsqueeze(1) * expert_outputs  # Higher is better
-            # WITH gradient trick
             expert_contributions = (
                 -torch.sign(output.squeeze(-1) - outsample_y.squeeze(-1)).unsqueeze(1)
                 * expert_outputs
@@ -454,8 +400,7 @@ class NSX(BaseModel):
             p = np.random.random()
             total_loss = p * expert_loss + (1 - p) * gate_loss
         elif self.total_loss_type == 'annealing':
-            expert_weight = min(1.0,
-                                self.current_step / self.annealing_temperature)  # Gradually increase expert importance
+            expert_weight = min(1.0, self.current_step / self.annealing_temperature)
             total_loss = expert_weight * expert_loss + (1 - expert_weight) * gate_loss
         elif self.total_loss_type == 'sum':
             # sum
@@ -464,22 +409,12 @@ class NSX(BaseModel):
             print(self.total_loss_type)
             raise ValueError("self.total_loss_type")
 
-        if self.add_specialization_loss:
-            spec_loss = self.specialization_loss(expert_outputs, gate_weights)
-            total_loss += self.specialization_factor * spec_loss  # Small weight for specialization
-
-        if self.add_ncl_loss:
-            ncl = self.ncl_loss(expert_outputs)
-            total_loss += self.ncl_factor * ncl
-            self.log("ncl_loss", ncl.detach(), batch_size=outsample_y.size(0), on_epoch=True)
-
         if self.add_balance_loss:
             bal = self.balance_loss(gate_weights)
             total_loss += self.balance_factor * bal
             self.log("balance_loss", bal.detach(), batch_size=outsample_y.size(0), on_epoch=True)
 
-        if self.include_combined_loss:
-            total_loss = total_loss + combined_loss
+        total_loss = total_loss + combined_loss
 
         # Log all components
         self.log("combined_loss", combined_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
@@ -512,20 +447,10 @@ class NSX(BaseModel):
         return total_loss
 
     def _gate_target(self, target_weights):
-        if self.detach_gate_targets:
-            return target_weights.detach()
-        return target_weights
+        return target_weights.detach()
 
-    def _point_loss(self, y, y_hat, mask, insample_y, y_hat_c=None, gate_weight=None):
+    def _point_loss(self, y, y_hat, mask, insample_y):
         kwargs = dict(y=y, y_hat=y_hat, mask=mask, y_insample=insample_y)
-        if y_hat_c is not None:
-            extra = {"y_hat_c": y_hat_c}
-            if gate_weight is not None:
-                extra["gate_weight"] = gate_weight
-            try:
-                return self.loss(**kwargs, **extra)
-            except TypeError:
-                pass
         try:
             return self.loss(**kwargs)
         except TypeError:
@@ -537,21 +462,6 @@ class NSX(BaseModel):
         progress = min(1.0, self.current_step / self.annealing_temperature)
         return max(final_temp, init_temp - progress * (init_temp - final_temp))
 
-    def ncl_loss(self, expert_outputs):
-        """Negative correlation learning: penalize experts that co-vary with the ensemble."""
-        num_experts = expert_outputs.size(1)
-        ensemble_mean = expert_outputs.mean(dim=1, keepdim=True)
-
-        ncl_terms = []
-        for i in range(num_experts):
-            expert_pred = expert_outputs[:, i:i + 1]
-            others = torch.cat([expert_outputs[:, :i], expert_outputs[:, i + 1:]], dim=1)
-            others_mean = others.mean(dim=1, keepdim=True)
-            correlation = ((expert_pred - ensemble_mean) * (others_mean - ensemble_mean)).mean()
-            ncl_terms.append(correlation)
-
-        return torch.stack(ncl_terms).mean()
-
     def balance_loss(self, gate_weights):
         """KL of mean gate usage toward uniform, minus entropy so the gate does not collapse."""
         expert_usage = gate_weights.mean(0)
@@ -559,21 +469,3 @@ class NSX(BaseModel):
         kl = F.kl_div(expert_usage.log(), target_usage, reduction='batchmean')
         entropy = -(gate_weights * torch.log(gate_weights + 1e-10)).sum(1).mean()
         return kl - 0.1 * entropy
-
-    def specialization_loss(self, expert_outputs, gate_weights):
-        """
-        Encourage each expert to specialize by penalizing when multiple experts
-        make similar predictions on samples where they have high gate weights
-        """
-        # Get pairwise differences between expert predictions
-        # [batch, num_experts, num_experts, horizon]
-        pairwise_diffs = (expert_outputs.unsqueeze(2) - expert_outputs.unsqueeze(1)).abs()
-
-        # Weight the differences by gate weights
-        # Only care when both experts have high weights
-        gate_products = gate_weights.unsqueeze(2) * gate_weights.unsqueeze(1)
-
-        # Compute loss - we want large differences when gate weights are high
-        spec_loss = -(pairwise_diffs.mean(-1) * gate_products).mean()
-
-        return spec_loss
