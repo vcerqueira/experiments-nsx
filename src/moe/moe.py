@@ -2,7 +2,6 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from neuralforecast.losses.pytorch import MAE
 from neuralforecast.common._base_model import BaseModel
 from neuralforecast.common._modules import MLP as MLPLayer
@@ -25,9 +24,9 @@ def _expert_init_kwargs(expert_arch, h, expert_kwargs):
         kwargs.setdefault("n_blocks", [1])
         kwargs.setdefault("mlp_units", [[128, 128]])
     elif expert_arch == "kan":
-        kwargs.setdefault("hidden_size", 64)
+        kwargs.setdefault("hidden_size", 128)
     elif expert_arch == "mlp":
-        kwargs.setdefault("hidden_size", 64)
+        kwargs.setdefault("hidden_size", 128)
 
     return kwargs
 
@@ -105,7 +104,6 @@ class NSX(BaseModel):
     def __init__(self,
                  h,
                  input_size,
-                 dropout: float = 0.1,
                  stat_exog_list=None,
                  futr_exog_list=None,
                  hist_exog_list=None,
@@ -135,15 +133,9 @@ class NSX(BaseModel):
                  expert_arch: str = 'mlp',  # ['mlp','kan','nbeats']
                  expert_kwargs=None,
                  gate='mlp',  # ['mlp','attention','linear']
-                 pooling: str = 'dense',  # ['dense','sparse','soft','ste']
+                 pooling: str = 'dense',  # ['dense','sparse','soft']
                  k: int = 3,  # Number of top experts for sparse pooling
-                 temperature: float = 1.0,  # Temperature for soft pooling
                  gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','ib_softmax_mse_grad','kl']
-                 add_balance_loss: bool = False,
-                 balance_factor: float = 0.01,
-                 anneal_temperature: bool = False,
-                 total_loss_type: str = 'annealing',  # ['random', 'annealing','sumsqr']
-                 annealing_temperature: int = 1000,
                  **trainer_kwargs):
 
         super(NSX, self).__init__(h=h,
@@ -189,7 +181,6 @@ class NSX(BaseModel):
             )
 
         self.num_experts = len(self.experts)
-        self.current_step = 0
 
         if gate == 'mlp':
             self.gate = MLPLayer(
@@ -209,22 +200,16 @@ class NSX(BaseModel):
         self.softmax = nn.Softmax(dim=1)
         k = min(k, self.num_experts)
         self.k = k
-        self.temperature = temperature
         if pooling == 'dense':
             self.pooling = DensePooling()
         elif pooling == 'sparse':
             self.pooling = SparsePooling(k=k)
         elif pooling == 'soft':
-            self.pooling = SoftPooling(temperature=temperature)
+            self.pooling = SoftPooling()
         else:
             raise ValueError(f"Unknown pooling={pooling!r}; expected 'dense', 'sparse', or 'soft'")
-        self.add_balance_loss = add_balance_loss
-        self.balance_factor = balance_factor
-        self.anneal_temperature = anneal_temperature
 
         self.gate_loss_type = gate_loss_type
-        self.total_loss_type = total_loss_type
-        self.annealing_temperature = annealing_temperature
 
     def forward(self, windows_batch: dict, return_components: bool = False):
         """
@@ -346,12 +331,10 @@ class NSX(BaseModel):
         expert_losses_tensor = torch.stack(expert_losses)
         expert_loss = expert_losses_tensor.mean()
 
-        temperature = self.get_temperature() if self.anneal_temperature else 1
-
         if self.gate_loss_type == 'ib_softmax_mse':
             # Softmax-based weighting
             expert_scores = -expert_losses_tensor  # Convert losses to scores
-            target_weights = self._gate_target(F.softmax(expert_scores / temperature, dim=0))
+            target_weights = self._gate_target(F.softmax(expert_scores, dim=0))
 
             target_weights_expanded = target_weights.unsqueeze(0).expand(gate_weights.size(0), -1)
 
@@ -359,7 +342,7 @@ class NSX(BaseModel):
             gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
         elif self.gate_loss_type == 'softmax_mse':
             expert_scores = -expert_losses_tensor  # Convert losses to scores
-            target_weights = self._gate_target(F.softmax(expert_scores / temperature, dim=0))
+            target_weights = self._gate_target(F.softmax(expert_scores, dim=0))
 
             gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
         elif self.gate_loss_type == 'ib_softmax_mse_grad':
@@ -369,7 +352,7 @@ class NSX(BaseModel):
             )
 
             expert_scores = expert_contributions.mean(dim=[0, -1])  # Average over batch and horizon
-            target_weights = self._gate_target(F.softmax(expert_scores / temperature, dim=0))
+            target_weights = self._gate_target(F.softmax(expert_scores, dim=0))
 
             # Expand to match batch size
             target_weights_expanded = target_weights.unsqueeze(0).expand(gate_weights.size(0), -1)
@@ -379,7 +362,7 @@ class NSX(BaseModel):
         else:
             # "kl" and any other name: rank experts by softmax(-loss).
             expert_scores = -expert_losses_tensor
-            target_weights = self._gate_target(F.softmax(expert_scores / temperature, dim=0))
+            target_weights = self._gate_target(F.softmax(expert_scores, dim=0))
             gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
 
         # Compute combined loss
@@ -396,25 +379,7 @@ class NSX(BaseModel):
                 insample_y=insample_y,
             )
 
-        if self.total_loss_type == 'random':
-            p = np.random.random()
-            total_loss = p * expert_loss + (1 - p) * gate_loss
-        elif self.total_loss_type == 'annealing':
-            expert_weight = min(1.0, self.current_step / self.annealing_temperature)
-            total_loss = expert_weight * expert_loss + (1 - expert_weight) * gate_loss
-        elif self.total_loss_type == 'sum':
-            # sum
-            total_loss = (expert_loss + gate_loss)
-        else:
-            print(self.total_loss_type)
-            raise ValueError("self.total_loss_type")
-
-        if self.add_balance_loss:
-            bal = self.balance_loss(gate_weights)
-            total_loss += self.balance_factor * bal
-            self.log("balance_loss", bal.detach(), batch_size=outsample_y.size(0), on_epoch=True)
-
-        total_loss = total_loss + combined_loss
+        total_loss = expert_loss + gate_loss + combined_loss
 
         # Log all components
         self.log("combined_loss", combined_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
@@ -442,7 +407,6 @@ class NSX(BaseModel):
         )
         self.train_trajectories.append((self.global_step, train_loss_log))
 
-        self.current_step += 1
         self.h = self.horizon_backup
         return total_loss
 
@@ -455,17 +419,3 @@ class NSX(BaseModel):
             return self.loss(**kwargs)
         except TypeError:
             return self.loss(y=y, y_hat=y_hat, mask=mask)
-
-    def get_temperature(self):
-        init_temp = 2.0
-        final_temp = 0.5
-        progress = min(1.0, self.current_step / self.annealing_temperature)
-        return max(final_temp, init_temp - progress * (init_temp - final_temp))
-
-    def balance_loss(self, gate_weights):
-        """KL of mean gate usage toward uniform, minus entropy so the gate does not collapse."""
-        expert_usage = gate_weights.mean(0)
-        target_usage = torch.ones_like(expert_usage) / gate_weights.size(1)
-        kl = F.kl_div(expert_usage.log(), target_usage, reduction='batchmean')
-        entropy = -(gate_weights * torch.log(gate_weights + 1e-10)).sum(1).mean()
-        return kl - 0.1 * entropy

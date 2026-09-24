@@ -47,9 +47,6 @@ print(results.groupby('pooling').mean(numeric_only=True)['Overall'])
 print(results.groupby('pooling').mean(numeric_only=True)['Overall'])
 results.groupby('pooling').median(numeric_only=True)
 results.groupby('gate_loss_type').median(numeric_only=True)
-results.groupby('total_loss_type').median(numeric_only=True)
-results.groupby('anneal_temperature').median(numeric_only=True)
-results.groupby('add_balance_loss').median(numeric_only=True)
 
 
 results_na = results.loc[results['Overall'].isna(),:]
@@ -93,12 +90,8 @@ for column in results.columns.drop('Overall'):
             'parameter': column,
             'value': value,
             'n': int(score.size),
-            # 'n_nan': int(score.isna().sum()),
-            # 'nan_rate': score.isna().mean(),
             'median': finite.median(),
-            # 'p25': finite.quantile(0.25),
-            # 'p75': finite.quantile(0.75),
-            'median_vs_global': finite.median() - global_median,
+            'vs_global': finite.median() - global_median,
         })
 
 effects = pd.DataFrame(effects)
