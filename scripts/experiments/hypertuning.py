@@ -18,7 +18,7 @@ from src.config import SEED, N_SAMPLES, MAX_SAMPLES, ENGINE, LIMIT_EPOCHS
 warnings.filterwarnings('ignore')
 
 # ---- data loading and partitioning
-target = 'monash_m3_monthly'
+target = 'monash_m1_monthly'
 # _, horizon, n_lags, _, _ = LongHorizonDatasetR.load_everything(target, resample_to='D')
 _, horizon, n_lags, _, _ = ChronosDataset.load_everything(target)
 df, horizon, n_lags, freq, seas_len = ChronosDataset.load_everything(target, min_n_instances=2 * (n_lags + horizon))
@@ -86,12 +86,3 @@ if __name__ == '__main__':
         print(err_outer)
 
         err_outer.to_csv(fp, index=False)
-        # try:
-        #     nf = NeuralForecast(models=[model], freq=freq)
-        #     cv = nf.cross_validation(df=df, **CV_SETUP)
-        #
-        #     cv.to_csv(fp, index=False)
-        # except (NotImplementedError, IndexError) as e:
-        #     print(f"Error on {target},{cfg_id}")
-        #     print(e)
-        #     continue

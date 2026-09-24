@@ -35,8 +35,7 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
 
 
-results['Overall'].describe()
-results['Overall'].isna().mean()
+print(results['Overall'].isna().mean())
 
 
 results.groupby('scaler_type').median(numeric_only=True)
@@ -94,11 +93,11 @@ for column in results.columns.drop('Overall'):
             'parameter': column,
             'value': value,
             'n': int(score.size),
-            'n_nan': int(score.isna().sum()),
-            'nan_rate': score.isna().mean(),
+            # 'n_nan': int(score.isna().sum()),
+            # 'nan_rate': score.isna().mean(),
             'median': finite.median(),
-            'p25': finite.quantile(0.25),
-            'p75': finite.quantile(0.75),
+            # 'p25': finite.quantile(0.25),
+            # 'p75': finite.quantile(0.75),
             'median_vs_global': finite.median() - global_median,
         })
 
@@ -106,4 +105,6 @@ effects = pd.DataFrame(effects)
 gap = effects.groupby('parameter')['median'].agg(lambda s: s.max() - s.min())
 effects = effects.join(gap.rename('gap'), on='parameter')
 effects = effects.sort_values(['gap', 'parameter', 'median'], ascending=[False, True, True])
+
+print("\n\n\n")
 print(effects.drop(columns='gap').to_string(index=False))
