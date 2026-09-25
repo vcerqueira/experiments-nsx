@@ -15,14 +15,16 @@ configs = ConfigSampler.generate_samples(
     random_state=SEED,
     return_df=True,
 )
+configs = configs[~configs.index.duplicated(keep='first')]
 
 rows = []
 for fp in sorted(RESULTS_PATH.glob('NSX,*,*.csv')):
-    _, config_id, _ = fp.stem.split(',', 2)
+    _, config_id, target = fp.stem.split(',', 2)
     score = pd.read_csv(fp)
     # NaN-loss runs are written as Overall,"" instead of a float.
     score = score.apply(pd.to_numeric, errors='coerce')
     score.insert(0, 'config_id', config_id)
+    score.insert(1, 'target', target)
     rows.append(score)
 
 scores = pd.concat(rows, ignore_index=True)
@@ -37,7 +39,7 @@ pd.set_option('display.max_rows', None)
 
 print(results['Overall'].isna().mean())
 
-results.sort_values('Overall')
+
 
 results.groupby('scaler_type').median(numeric_only=True)
 results.groupby('max_steps').median(numeric_only=True)
@@ -73,22 +75,24 @@ nan_rates = pd.concat(nan_rates, ignore_index=True).sort_values('lift', ascendin
 print(results)
 
 
-def _levels(series, max_levels=25):
-    if series.nunique(dropna=False) <= max_levels:
-        return series
-    return pd.qcut(series, q=4, duplicates='drop')
-
-
 effects = []
 global_median = results['Overall'].median()
-for column in results.columns.drop('Overall'):
-    level = _levels(results[column])
-    for value, score in results.groupby(level, dropna=False, observed=False)['Overall']:
+# Range index: config_id repeats once per dataset, and a Series grouper
+# aligned on that index does not count result files.
+work = results.reset_index(drop=True)
+for column in work.columns.drop(['Overall']):
+    series = work[column]
+    if series.nunique(dropna=False) > 25:
+        groups = pd.qcut(series, q=4, duplicates='drop')
+        grouped = work.groupby(groups, observed=True)['Overall']
+    else:
+        grouped = work.groupby(column, dropna=False, observed=True)['Overall']
+    for value, score in grouped:
         finite = score.dropna()
         effects.append({
             'parameter': column,
             'value': value,
-            'n': int(score.size),
+            'n': int(len(score)),
             'median': finite.median(),
             'vs_global': finite.median() - global_median,
         })
@@ -97,7 +101,8 @@ effects = pd.DataFrame(effects)
 gap = effects.groupby('parameter')['median'].agg(lambda s: s.max() - s.min())
 effects = effects.join(gap.rename('gap'), on='parameter')
 effects = effects.sort_values(['gap', 'parameter', 'median'], ascending=[False, True, True])
-
+print("\n\n\n\n\n\n\n\n\n")
+print(results.sort_values('Overall').iloc[:,-4:])
 print("\n\n\n")
 print(effects.drop(columns='gap').to_string(index=False))
 

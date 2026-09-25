@@ -24,15 +24,15 @@ class SparsePooling(nn.Module):
         return gate_weights
 
 
-class SoftPooling(nn.Module):
-    """Temperature-scaled softmax over all experts."""
-
-    def __init__(self, temperature: float = 1.0):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
-        return F.softmax(gate_logits / self.temperature, dim=1)
+# class SoftPooling(nn.Module):
+#     """Temperature-scaled softmax over all experts."""
+#
+#     def __init__(self, temperature: float = 1.0):
+#         super().__init__()
+#         self.temperature = temperature
+#
+#     def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
+#         return F.softmax(gate_logits / self.temperature, dim=1)
 
 #
 # class StraightThroughPooling(nn.Module):

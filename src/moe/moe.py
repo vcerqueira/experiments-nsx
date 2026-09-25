@@ -4,9 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from neuralforecast.losses.pytorch import MAE
 from neuralforecast.common._base_model import BaseModel
+from neuralforecast.common._modules import MLP as MLPLayer
 from neuralforecast.models import MLP, KAN, NBEATS
 
-from src.moe.pooling import DensePooling, SparsePooling, SoftPooling
+from src.moe.pooling import DensePooling, SparsePooling
 
 EXPERT_REGISTRY = {
     "mlp": MLP,
@@ -22,7 +23,7 @@ def _expert_init_kwargs(expert_arch, h, expert_kwargs):
         kwargs.setdefault("n_blocks", [1])
         kwargs.setdefault("mlp_units", [[128, 128]])
     elif expert_arch == "kan":
-        kwargs.setdefault("hidden_size", 128)
+        kwargs.setdefault("hidden_size", 256)
     elif expert_arch == "mlp":
         kwargs.setdefault("hidden_size", 128)
 
@@ -132,8 +133,8 @@ class NSX(BaseModel):
                  expert_kwargs=None,
                  pooling: str = 'dense',  # ['dense','sparse','soft']
                  k: int = 3,  # Number of top experts for sparse pooling
+                 gate: str = 'linear',  # ['linear','linear_bias','mlp']
                  gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','ib_softmax_mse_grad','kl','ib_softmax_mse_window','ib_softmax_mse_grad_window']
-                 pooled_combined_loss: bool = False,
                  **trainer_kwargs):
 
         super(NSX, self).__init__(h=h,
@@ -179,7 +180,21 @@ class NSX(BaseModel):
             )
 
         self.num_experts = len(self.experts)
-        self.gate = nn.Linear(self.input_size, self.num_experts, bias=False)
+        if gate == 'linear':
+            self.gate = nn.Linear(self.input_size, self.num_experts, bias=False)
+        elif gate == 'linear_bias':
+            self.gate = nn.Linear(self.input_size, self.num_experts, bias=True)
+        elif gate == 'mlp':
+            self.gate = MLPLayer(
+                self.input_size,
+                self.num_experts,
+                activation='ReLU',
+                hidden_size=32,
+                num_layers=1,
+                dropout=0.1,
+            )
+        else:
+            raise ValueError(f"Unknown gate={gate!r}; expected 'linear', 'linear_bias', or 'mlp'")
 
         self.softmax = nn.Softmax(dim=1)
         k = min(k, self.num_experts)
@@ -188,13 +203,10 @@ class NSX(BaseModel):
             self.pooling = DensePooling()
         elif pooling == 'sparse':
             self.pooling = SparsePooling(k=k)
-        elif pooling == 'soft':
-            self.pooling = SoftPooling()
         else:
-            raise ValueError(f"Unknown pooling={pooling!r}; expected 'dense', 'sparse', or 'soft'")
+            raise ValueError(f"Unknown pooling={pooling!r}; expected 'dense', 'sparse'")
 
         self.gate_loss_type = gate_loss_type
-        self.pooled_combined_loss = pooled_combined_loss
 
     def forward(self, windows_batch: dict, return_components: bool = False):
         """
@@ -209,13 +221,9 @@ class NSX(BaseModel):
         insample_y = windows_batch['insample_y']  # [B, L] or [B, L, 1]
         gate_logits = self.gate(insample_y.squeeze(-1))
         full_gate_weights = self.softmax(gate_logits)  # [B, num_experts]
-        pooled_gate_weights = self.pooling(gate_logits)
-        # Expert losses and gate targets always see every expert. The forecast
-        # mixture is pooled in training only when pooled_combined_loss is set.
-        if return_components and not self.pooled_combined_loss:
-            gate_weights = full_gate_weights
-        else:
-            gate_weights = pooled_gate_weights
+        # The forecast uses the pooled mixture. Expert losses and gate targets
+        # still see every expert through full_gate_weights.
+        gate_weights = self.pooling(gate_logits)
 
         expert_outputs = []
         for expert_module in self.experts:
