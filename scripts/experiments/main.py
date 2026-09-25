@@ -33,7 +33,6 @@ models = [
         max_steps=10,
         scaler_type='standard',
         batch_size=32,
-        gate='linear',
         gate_loss_type='ib_softmax_mse_grad',
         pooling='dense',),
     MLP(h=horizon,

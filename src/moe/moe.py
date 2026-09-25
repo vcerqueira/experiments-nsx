@@ -4,10 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from neuralforecast.losses.pytorch import MAE
 from neuralforecast.common._base_model import BaseModel
-from neuralforecast.common._modules import MLP as MLPLayer
 from neuralforecast.models import MLP, KAN, NBEATS
 
-from src.moe.gates import AttentionGate
 from src.moe.pooling import DensePooling, SparsePooling, SoftPooling
 
 EXPERT_REGISTRY = {
@@ -132,10 +130,10 @@ class NSX(BaseModel):
                  num_experts: int = 6,
                  expert_arch: str = 'mlp',  # ['mlp','kan','nbeats']
                  expert_kwargs=None,
-                 gate='mlp',  # ['mlp','attention','linear']
                  pooling: str = 'dense',  # ['dense','sparse','soft']
                  k: int = 3,  # Number of top experts for sparse pooling
-                 gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','ib_softmax_mse_grad','kl']
+                 gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','ib_softmax_mse_grad','kl','ib_softmax_mse_window','ib_softmax_mse_grad_window']
+                 pooled_combined_loss: bool = False,
                  **trainer_kwargs):
 
         super(NSX, self).__init__(h=h,
@@ -181,21 +179,7 @@ class NSX(BaseModel):
             )
 
         self.num_experts = len(self.experts)
-
-        if gate == 'mlp':
-            self.gate = MLPLayer(
-                self.input_size,
-                self.num_experts,
-                activation="ReLU",
-                hidden_size=32,
-                num_layers=1,
-                dropout=0.1)
-        elif gate == 'attention':
-            self.gate = AttentionGate(self.input_size, self.num_experts)
-        elif gate == 'linear':
-            self.gate = nn.Linear(self.input_size, self.num_experts, bias=False)
-        else:
-            raise ValueError(f"Unknown gate={gate!r}")
+        self.gate = nn.Linear(self.input_size, self.num_experts, bias=False)
 
         self.softmax = nn.Softmax(dim=1)
         k = min(k, self.num_experts)
@@ -210,6 +194,7 @@ class NSX(BaseModel):
             raise ValueError(f"Unknown pooling={pooling!r}; expected 'dense', 'sparse', or 'soft'")
 
         self.gate_loss_type = gate_loss_type
+        self.pooled_combined_loss = pooled_combined_loss
 
     def forward(self, windows_batch: dict, return_components: bool = False):
         """
@@ -224,9 +209,13 @@ class NSX(BaseModel):
         insample_y = windows_batch['insample_y']  # [B, L] or [B, L, 1]
         gate_logits = self.gate(insample_y.squeeze(-1))
         full_gate_weights = self.softmax(gate_logits)  # [B, num_experts]
-        # Training (return_components) always mixes densely so every expert gets a
-        # gradient. Sparse / STE / temperature pooling is inference-only.
-        gate_weights = full_gate_weights if return_components else self.pooling(gate_logits)
+        pooled_gate_weights = self.pooling(gate_logits)
+        # Expert losses and gate targets always see every expert. The forecast
+        # mixture is pooled in training only when pooled_combined_loss is set.
+        if return_components and not self.pooled_combined_loss:
+            gate_weights = full_gate_weights
+        else:
+            gate_weights = pooled_gate_weights
 
         expert_outputs = []
         for expert_module in self.experts:
@@ -313,6 +302,7 @@ class NSX(BaseModel):
         output = self.loss.domain_map(output)
 
         expert_losses = []
+        per_window_losses = []
         for i in range(expert_outputs.size(1)):
             expert_output = self.loss.domain_map(expert_outputs[:, i].unsqueeze(-1))
             if self.loss.is_distribution_output:
@@ -325,6 +315,9 @@ class NSX(BaseModel):
                     y_hat=expert_output,
                     mask=outsample_mask,
                     insample_y=insample_y,
+                )
+                per_window_losses.append(
+                    self._per_window_point_loss(outsample_y, expert_output, outsample_mask)
                 )
             expert_losses.append(expert_loss)
 
@@ -359,6 +352,18 @@ class NSX(BaseModel):
 
             # Compute gate loss
             gate_loss = F.mse_loss(gate_weights, target_weights_expanded)
+        elif self.gate_loss_type == 'ib_softmax_mse_window':
+            per_window = torch.stack(per_window_losses, dim=1)
+            target_weights = self._gate_target(F.softmax(-per_window, dim=1))
+            gate_loss = F.mse_loss(gate_weights, target_weights)
+        elif self.gate_loss_type == 'ib_softmax_mse_grad_window':
+            expert_contributions = (
+                -torch.sign(output.squeeze(-1) - outsample_y.squeeze(-1)).unsqueeze(1)
+                * expert_outputs
+            )
+            expert_scores = expert_contributions.mean(dim=-1)
+            target_weights = self._gate_target(F.softmax(expert_scores, dim=1))
+            gate_loss = F.mse_loss(gate_weights, target_weights)
         else:
             # "kl" and any other name: rank experts by softmax(-loss).
             expert_scores = -expert_losses_tensor
@@ -412,6 +417,15 @@ class NSX(BaseModel):
 
     def _gate_target(self, target_weights):
         return target_weights.detach()
+
+    def _per_window_point_loss(self, y, y_hat, mask):
+        y = y.squeeze(-1)
+        y_hat = y_hat.squeeze(-1)
+        err = (y_hat - y).abs()
+        if mask is None:
+            return err.mean(dim=-1)
+        mask = mask.squeeze(-1).to(err.dtype)
+        return (err * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
 
     def _point_loss(self, y, y_hat, mask, insample_y):
         kwargs = dict(y=y, y_hat=y_hat, mask=mask, y_insample=insample_y)

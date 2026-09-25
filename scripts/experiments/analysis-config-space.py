@@ -37,12 +37,11 @@ pd.set_option('display.max_rows', None)
 
 print(results['Overall'].isna().mean())
 
+results.sort_values('Overall')
 
 results.groupby('scaler_type').median(numeric_only=True)
 results.groupby('max_steps').median(numeric_only=True)
 results.groupby('num_experts').median(numeric_only=True)
-print(results.groupby('gate').median(numeric_only=True)['Overall'])
-print(results.groupby('gate').mean(numeric_only=True)['Overall'])
 print(results.groupby('pooling').mean(numeric_only=True)['Overall'])
 print(results.groupby('pooling').mean(numeric_only=True)['Overall'])
 results.groupby('pooling').median(numeric_only=True)
@@ -101,3 +100,4 @@ effects = effects.sort_values(['gap', 'parameter', 'median'], ascending=[False, 
 
 print("\n\n\n")
 print(effects.drop(columns='gap').to_string(index=False))
+

@@ -18,7 +18,7 @@ from src.config import SEED, N_SAMPLES, MAX_SAMPLES, ENGINE, LIMIT_EPOCHS
 warnings.filterwarnings('ignore')
 
 # ---- data loading and partitioning
-target = 'monash_m1_quarterly'
+target = 'monash_m1_monthly'
 # _, horizon, n_lags, _, _ = LongHorizonDatasetR.load_everything(target, resample_to='D')
 _, horizon, n_lags, _, _ = ChronosDataset.load_everything(target)
 df, horizon, n_lags, freq, seas_len = ChronosDataset.load_everything(target, min_n_instances=2 * (n_lags + horizon))
