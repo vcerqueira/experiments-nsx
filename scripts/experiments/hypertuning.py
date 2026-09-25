@@ -66,11 +66,14 @@ if __name__ == '__main__':
                 continue
 
             print(f"Running config {n_configs} / {MAX_SAMPLES}")
-            model = ConfigSampler.create_model_instance(model_config=config_sample,
+            try:
+                model = ConfigSampler.create_model_instance(model_config=config_sample,
                                                         horizon=horizon,
                                                         input_size=n_lags,
                                                         engine=ENGINE,
                                                         limit_epochs=LIMIT_EPOCHS)
+            except ValueError as e:
+                continue
 
             try:
                 nf = NeuralForecast(models=[model], freq=freq)
@@ -88,6 +91,7 @@ if __name__ == '__main__':
                     raise
                 print(f"Loss is NaN on {target},{cfg_id}")
                 err_outer = pd.Series([float("nan")], name="Overall")
+
 
             print(err_outer)
 

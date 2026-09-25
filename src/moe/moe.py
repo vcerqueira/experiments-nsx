@@ -135,6 +135,9 @@ class NSX(BaseModel):
                  k: int = 3,  # Number of top experts for sparse pooling
                  gate: str = 'linear',  # ['linear','linear_bias','mlp']
                  gate_loss_type: str = 'ib_softmax_mse',  # ['ib_softmax_mse','softmax_mse','ib_softmax_mse_grad','kl','ib_softmax_mse_window','ib_softmax_mse_grad_window']
+                 online_eg: bool = False,
+                 specialize: bool = False,
+                 load_balance_coef: float = 0.01,
                  **trainer_kwargs):
 
         super(NSX, self).__init__(h=h,
@@ -207,6 +210,30 @@ class NSX(BaseModel):
             raise ValueError(f"Unknown pooling={pooling!r}; expected 'dense', 'sparse'")
 
         self.gate_loss_type = gate_loss_type
+        self.online_eg = bool(online_eg)
+        self.specialize = bool(specialize)
+        self.load_balance_coef = float(load_balance_coef)
+        if self.online_eg and self.specialize:
+            raise ValueError(
+                "online_eg and specialize are separate modes; "
+                "online_eg learns one mixture, specialize learns an input-dependent gate"
+            )
+        if self.specialize and self.load_balance_coef < 0:
+            raise ValueError(
+                f"load_balance_coef must be >= 0, got {self.load_balance_coef}"
+            )
+        if self.online_eg:
+            if not isinstance(self.loss, MAE):
+                raise ValueError(
+                    "online_eg requires MAE so the gate update is the absolute-loss subgradient"
+                )
+            for parameter in self.gate.parameters():
+                parameter.requires_grad_(False)
+            self.register_buffer("eg_logits", torch.zeros(self.num_experts))
+            self.register_buffer("eg_weight_sum", torch.zeros(self.num_experts))
+            self.register_buffer("eg_steps", torch.zeros((), dtype=torch.long))
+            self.register_buffer("eg_grad_bound", torch.zeros(()))
+            self.eg_history = []
 
     def forward(self, windows_batch: dict, return_components: bool = False):
         """
@@ -215,15 +242,22 @@ class NSX(BaseModel):
             return_components (bool): If True, returns individual expert outputs and gate weights
         Returns:
             torch.Tensor if return_components=False: Final weighted predictions
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor] if return_components=True:
-                (combined_output, expert_outputs, full_gate_weights)
+            Tuple if return_components=True:
+                (combined_output, expert_outputs, full_gate_weights, mixture_weights)
+                mixture_weights are the weights that form the forecast.
         """
         insample_y = windows_batch['insample_y']  # [B, L] or [B, L, 1]
-        gate_logits = self.gate(insample_y.squeeze(-1))
-        full_gate_weights = self.softmax(gate_logits)  # [B, num_experts]
-        # The forecast uses the pooled mixture. Expert losses and gate targets
-        # still see every expert through full_gate_weights.
-        gate_weights = self.pooling(gate_logits)
+        if self.online_eg:
+            # Training plays the EG state from previous steps. Prediction plays
+            # the average of those played weights. Dense simplex weights only.
+            gate_weights = self._eg_played_weights(insample_y.shape[0])
+            full_gate_weights = gate_weights
+        else:
+            gate_logits = self.gate(insample_y.squeeze(-1))
+            full_gate_weights = self.softmax(gate_logits)  # [B, num_experts]
+            # The forecast uses the pooled mixture. Expert losses and gate targets
+            # still see every expert through full_gate_weights.
+            gate_weights = self.pooling(gate_logits)
 
         expert_outputs = []
         for expert_module in self.experts:
@@ -237,8 +271,101 @@ class NSX(BaseModel):
         combined_output = combined_output.unsqueeze(-1)  # [B, h, 1] for NeuralForecast
 
         if return_components:
-            return combined_output, expert_outputs, full_gate_weights
+            return combined_output, expert_outputs, full_gate_weights, gate_weights
         return combined_output
+
+    def _eg_weight_vector(self):
+        if self.training or int(self.eg_steps) == 0:
+            return torch.softmax(self.eg_logits, dim=0)
+        averaged = self.eg_weight_sum / self.eg_steps.to(self.eg_weight_sum.dtype)
+        return averaged / averaged.sum().clamp_min(1e-12)
+
+    def _eg_played_weights(self, batch_size):
+        weights = self._eg_weight_vector()
+        if self.training:
+            self._eg_round_weights = weights.detach()
+        return weights.detach().unsqueeze(0).expand(batch_size, -1)
+
+    def _mae_weight_grad(self, y_hat, y, expert_forecasts, mask):
+        """Subgradient of weighted MAE with respect to the mixture weights."""
+        y_hat = y_hat.detach()
+        expert_forecasts = expert_forecasts.detach()
+        residual_sign = torch.sign(y_hat - y)
+        sample_weights = self.loss._compute_weights(y=y, mask=mask).to(residual_sign.dtype)
+        if residual_sign.ndim == 3 and residual_sign.size(-1) == 1:
+            residual_sign = residual_sign.squeeze(-1)
+            sample_weights = sample_weights.squeeze(-1)
+        numer = torch.einsum("bh,beh->e", sample_weights * residual_sign, expert_forecasts)
+        denom = sample_weights.sum().clamp_min(1e-8)
+        return numer / denom
+
+    def _eg_update(self, y_hat, y, expert_forecasts, mask):
+        """One exponentiated-gradient step. The played weights stay those of this round."""
+        grad = self._mae_weight_grad(y_hat, y, expert_forecasts, mask)
+        grad_inf = grad.abs().max()
+        self.eg_grad_bound.copy_(torch.maximum(self.eg_grad_bound, grad_inf))
+        step = self.eg_steps.to(device=grad.device, dtype=grad.dtype) + 1
+        log_experts = torch.log(grad.new_tensor(float(self.num_experts)))
+        grad_bound = self.eg_grad_bound.clamp_min(1e-8)
+        eta = torch.sqrt(log_experts / (step * grad_bound.square()))
+        played = self._eg_round_weights.detach()
+        self.eg_logits.sub_(eta * grad)
+        self.eg_logits.sub_(self.eg_logits.mean())
+        self.eg_weight_sum.add_(played)
+        self.eg_steps.add_(1)
+        return eta.detach(), grad.detach(), played.detach()
+
+    def _responsibility_expert_loss(self, per_window_losses, played_weights):
+        """Train expert i on window b in proportion to w_{b,i}.
+
+        w is detached, so this term updates experts and leaves the gate to the
+        mixture loss.
+        """
+        per_window = torch.stack(per_window_losses, dim=1)
+        weights = played_weights.detach()
+        if per_window.shape != weights.shape:
+            raise ValueError(
+                f"responsibility weights {tuple(weights.shape)} do not match "
+                f"per-window losses {tuple(per_window.shape)}"
+            )
+        return (weights * per_window).sum() / weights.sum().clamp_min(1e-8)
+
+    def _load_balance_penalty(self, gate_weights):
+        """Small push toward using every expert.
+
+        E * sum_i usage_i^2 is 1 when the gate is uniform and grows to E if one
+        expert takes the batch. load_balance_coef keeps that far below a full
+        extra copy of every expert's MAE.
+        """
+        usage = gate_weights.mean(dim=0)
+        imbalance = self.num_experts * usage.square().sum()
+        return self.load_balance_coef * imbalance
+
+    def eg_regret(self):
+        """Regret of the played gate on the training-step sequence."""
+        if not getattr(self, "eg_history", None):
+            raise RuntimeError("online_eg has not recorded any training steps")
+        played_loss = 0.0
+        expert_totals = None
+        linearized = 0.0
+        linearized_expert = None
+        for row in self.eg_history:
+            played_loss += row["played_loss"]
+            if expert_totals is None:
+                expert_totals = [0.0] * len(row["expert_losses"])
+                linearized_expert = [0.0] * len(row["g"])
+            for index, loss_value in enumerate(row["expert_losses"]):
+                expert_totals[index] += loss_value
+            linearized += sum(
+                weight * grad_value for weight, grad_value in zip(row["w"], row["g"])
+            )
+            for index, grad_value in enumerate(row["g"]):
+                linearized_expert[index] += grad_value
+        return {
+            "mae_regret_vs_best_expert": played_loss - min(expert_totals),
+            "linearized_regret": linearized - min(linearized_expert),
+            "steps": len(self.eg_history),
+        }
 
     def training_step(self, batch, batch_idx):
         if self.RECURRENT:
@@ -306,13 +433,21 @@ class NSX(BaseModel):
         )
 
         # Get predictions and component analysis
-        output, expert_outputs, gate_weights = self(windows_batch, return_components=True)
+        output, expert_outputs, gate_weights, mixture_weights = self(
+            windows_batch, return_components=True
+        )
         output = self.loss.domain_map(output)
 
         expert_losses = []
         per_window_losses = []
+        mapped_experts = []
         for i in range(expert_outputs.size(1)):
             expert_output = self.loss.domain_map(expert_outputs[:, i].unsqueeze(-1))
+            if self.online_eg:
+                if expert_output.ndim == 3 and expert_output.size(-1) == 1:
+                    mapped_experts.append(expert_output.squeeze(-1))
+                else:
+                    mapped_experts.append(expert_output)
             if self.loss.is_distribution_output:
                 y_loc, y_scale = self._get_loc_scale(y_idx)
                 distr_args = self.loss.scale_decouple(output=expert_output, loc=y_loc, scale=y_scale)
@@ -332,7 +467,21 @@ class NSX(BaseModel):
         expert_losses_tensor = torch.stack(expert_losses)
         expert_loss = expert_losses_tensor.mean()
 
-        if self.gate_loss_type == 'ib_softmax_mse':
+        if self.online_eg:
+            eta, eg_grad, played_weights = self._eg_update(
+                y_hat=output,
+                y=outsample_y,
+                expert_forecasts=torch.stack(mapped_experts, dim=1),
+                mask=outsample_mask,
+            )
+        elif self.specialize:
+            if not per_window_losses:
+                raise ValueError("specialize requires a point forecast loss")
+            # Experts follow the played mixture. The gate does not: its only
+            # routing signal is the mixture loss below, plus a light balance term.
+            expert_loss = self._responsibility_expert_loss(per_window_losses, mixture_weights)
+            load_balance = self._load_balance_penalty(gate_weights)
+        elif self.gate_loss_type == 'ib_softmax_mse':
             # Softmax-based weighting
             expert_scores = -expert_losses_tensor  # Convert losses to scores
             target_weights = self._gate_target(F.softmax(expert_scores, dim=0))
@@ -374,9 +523,7 @@ class NSX(BaseModel):
             gate_loss = F.mse_loss(gate_weights, target_weights)
         else:
             # "kl" and any other name: rank experts by softmax(-loss).
-            expert_scores = -expert_losses_tensor
-            target_weights = self._gate_target(F.softmax(expert_scores, dim=0))
-            gate_loss = F.mse_loss(gate_weights.mean(0), target_weights)
+            raise ValueError(f"Unknown gate_loss_type={self.gate_loss_type!r}; expected 'ib_softmax_mse', 'softmax_mse', 'ib_softmax_mse_grad', 'ib_softmax_mse_window', or 'ib_softmax_mse_grad_window'")
 
         # Compute combined loss
         if self.loss.is_distribution_output:
@@ -392,12 +539,37 @@ class NSX(BaseModel):
                 insample_y=insample_y,
             )
 
-        total_loss = expert_loss + gate_loss + combined_loss
+        if self.online_eg:
+            total_loss = expert_loss + combined_loss
+        elif self.specialize:
+            total_loss = expert_loss + combined_loss + load_balance
+        else:
+            total_loss = expert_loss + gate_loss + combined_loss
 
         # Log all components
         self.log("combined_loss", combined_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
         self.log("expert_loss", expert_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
-        self.log("gate_loss", gate_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
+        if self.online_eg:
+            self.eg_history.append({
+                "step": int(self.global_step),
+                "played_loss": combined_loss.detach().item(),
+                "expert_losses": [loss.detach().item() for loss in expert_losses],
+                "eta": eta.item(),
+                "g": eg_grad.tolist(),
+                "w": played_weights.tolist(),
+            })
+            self.log("eg_eta", eta, batch_size=outsample_y.size(0), on_epoch=True)
+            for i, grad_value in enumerate(eg_grad):
+                self.log(
+                    f"eg_g_{i}",
+                    grad_value,
+                    batch_size=outsample_y.size(0),
+                    on_epoch=True,
+                )
+        elif self.specialize:
+            self.log("load_balance", load_balance.detach(), batch_size=outsample_y.size(0), on_epoch=True)
+        else:
+            self.log("gate_loss", gate_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
 
         # Log individual expert losses and usage
         for i, loss in enumerate(expert_losses):
