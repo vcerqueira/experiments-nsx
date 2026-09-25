@@ -1,7 +1,9 @@
 import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 from neuralforecast.losses.pytorch import MAE
 from neuralforecast.common._base_model import BaseModel
 from neuralforecast.common._modules import MLP as MLPLayer
@@ -28,6 +30,44 @@ def _expert_init_kwargs(expert_arch, h, expert_kwargs):
         kwargs.setdefault("hidden_size", 128)
 
     return kwargs
+
+
+class _SeriesIndexedDataset(Dataset):
+    """Dataset wrapper that keeps NeuralForecast's integer series index."""
+
+    def __init__(self, base):
+        self.base = base
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        item = dict(self.base[idx])
+        item["series_idx"] = int(idx)
+        return item
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+
+def _install_series_collate():
+    """Keep series_idx in batches. The stock collate drops every key it does not know."""
+    from neuralforecast.tsdataset import TimeSeriesLoader
+
+    if getattr(TimeSeriesLoader, "_nsx_series_collate", False):
+        return
+    original = TimeSeriesLoader._collate_fn
+
+    def _collate_fn(self, batch):
+        collated = original(self, batch)
+        if batch and isinstance(batch[0], dict) and "series_idx" in batch[0]:
+            collated["series_idx"] = torch.tensor(
+                [int(item["series_idx"]) for item in batch], dtype=torch.long
+            )
+        return collated
+
+    TimeSeriesLoader._collate_fn = _collate_fn
+    TimeSeriesLoader._nsx_series_collate = True
 
 
 def _build_experts(h, input_size, num_experts, expert_arch, expert_kwargs):
@@ -138,6 +178,8 @@ class NSX(BaseModel):
                  online_eg: bool = False,
                  specialize: bool = False,
                  load_balance_coef: float = 0.01,
+                 series_state: bool = False,
+                 series_state_eta: float = 1.0,
                  **trainer_kwargs):
 
         super(NSX, self).__init__(h=h,
@@ -213,10 +255,22 @@ class NSX(BaseModel):
         self.online_eg = bool(online_eg)
         self.specialize = bool(specialize)
         self.load_balance_coef = float(load_balance_coef)
+        self.series_state = bool(series_state)
+        self.series_state_eta = float(series_state_eta)
+        self.series_cumloss = None
+        self.series_visits = None
         if self.online_eg and self.specialize:
             raise ValueError(
                 "online_eg and specialize are separate modes; "
                 "online_eg learns one mixture, specialize learns an input-dependent gate"
+            )
+        if self.series_state and (self.online_eg or self.specialize):
+            raise ValueError(
+                "series_state plays the per-series Hedge table and cannot be combined with online_eg or specialize"
+            )
+        if self.series_state and self.series_state_eta <= 0:
+            raise ValueError(
+                f"series_state_eta must be > 0, got {self.series_state_eta}"
             )
         if self.specialize and self.load_balance_coef < 0:
             raise ValueError(
@@ -234,6 +288,9 @@ class NSX(BaseModel):
             self.register_buffer("eg_steps", torch.zeros((), dtype=torch.long))
             self.register_buffer("eg_grad_bound", torch.zeros(()))
             self.eg_history = []
+        if self.series_state:
+            for parameter in self.gate.parameters():
+                parameter.requires_grad_(False)
 
     def forward(self, windows_batch: dict, return_components: bool = False):
         """
@@ -247,7 +304,11 @@ class NSX(BaseModel):
                 mixture_weights are the weights that form the forecast.
         """
         insample_y = windows_batch['insample_y']  # [B, L] or [B, L, 1]
-        if self.online_eg:
+        hedge_weights = windows_batch.get("hedge_weights")
+        if hedge_weights is not None:
+            gate_weights = hedge_weights
+            full_gate_weights = gate_weights
+        elif self.online_eg:
             # Training plays the EG state from previous steps. Prediction plays
             # the average of those played weights. Dense simplex weights only.
             gate_weights = self._eg_played_weights(insample_y.shape[0])
@@ -367,6 +428,147 @@ class NSX(BaseModel):
             "steps": len(self.eg_history),
         }
 
+    def on_fit_start(self):
+        super().on_fit_start()
+        if not self.series_state:
+            return
+        _install_series_collate()
+        dataset = self.trainer.datamodule.dataset
+        if not isinstance(dataset, _SeriesIndexedDataset):
+            dataset = _SeriesIndexedDataset(dataset)
+            self.trainer.datamodule.dataset = dataset
+        n_series = len(dataset)
+        self.series_cumloss = torch.zeros(
+            n_series, self.num_experts, device=self.device
+        )
+        self.series_visits = torch.zeros(n_series, dtype=torch.long, device=self.device)
+
+    def _train_windows_per_serie(self, temporal):
+        window_size = self.input_size + self.h
+        if self.val_size + self.test_size > 0:
+            cutoff = -self.val_size - self.test_size
+            temporal = temporal[:, :, :cutoff]
+        temporal = self.padder_train(temporal)
+        length = temporal.shape[-1]
+        return (length - window_size) // self.step_size + 1
+
+    def _window_series_index(self, batch, final_condition, w_idxs):
+        if "series_idx" not in batch:
+            raise RuntimeError(
+                "series_state requires series_idx on the batch"
+            )
+        flat = final_condition[w_idxs]
+        windows_per_serie = self._train_windows_per_serie(batch["temporal"])
+        local = torch.div(flat, windows_per_serie, rounding_mode="floor")
+        series_idx = batch["series_idx"].to(device=local.device)
+        return series_idx[local]
+
+    def _hedge_weights(self, series_index):
+        if self.series_cumloss is None:
+            raise RuntimeError("series_state weights require the cumulative table from fit")
+        losses = self.series_cumloss.to(device=series_index.device, dtype=torch.float32)
+        n_series = losses.shape[0]
+        valid = (series_index >= 0) & (series_index < n_series)
+        safe_index = series_index.clamp(0, max(n_series - 1, 0))
+        gathered = losses[safe_index]
+        weights = torch.softmax(-self.series_state_eta * gathered, dim=-1)
+        if not torch.all(valid):
+            uniform = torch.full_like(weights, 1.0 / self.num_experts)
+            weights = torch.where(valid.unsqueeze(-1), weights, uniform)
+        return weights.detach()
+
+    def predict(self, dataset, **kwargs):
+        if self.series_state:
+            _install_series_collate()
+            if not isinstance(dataset, _SeriesIndexedDataset):
+                dataset = _SeriesIndexedDataset(dataset)
+        return super().predict(dataset, **kwargs)
+
+    def _predict_windows_per_serie(self, batch):
+        temporal = batch["temporal"]
+        window_size = self.input_size + self.h
+        initial_input = temporal.shape[-1] - self.test_size
+        if initial_input <= self.input_size:
+            temporal = F.pad(
+                temporal,
+                pad=(self.input_size - initial_input, 0),
+                mode="constant",
+                value=0.0,
+            )
+        cutoff = -self.input_size - self.test_size
+        temporal = temporal[:, :, cutoff:]
+        if self.test_size == 0 and len(self.futr_exog_list) == 0:
+            temporal = F.pad(temporal, pad=(0, self.h), mode="constant", value=0.0)
+        length = temporal.shape[-1]
+        return (length - window_size) // self.predict_step_size + 1
+
+    def _arm_predict_hedge(self, batch):
+        if "series_idx" not in batch:
+            raise RuntimeError("series_state predict requires series_idx on the batch")
+        windows_per_serie = self._predict_windows_per_serie(batch)
+        n_series = batch["series_idx"].shape[0]
+        flat = torch.arange(
+            n_series * windows_per_serie, device=batch["series_idx"].device
+        )
+        local = torch.div(flat, windows_per_serie, rounding_mode="floor")
+        series = batch["series_idx"].to(device=flat.device)[local]
+        self._predict_hedge_weights = self._hedge_weights(series)
+        self._predict_hedge_cursor = 0
+
+    def _predict_step_direct(self, batch, batch_idx, recursive=False):
+        if self.series_state and not recursive:
+            self._arm_predict_hedge(batch)
+        return super()._predict_step_direct(batch, batch_idx, recursive=recursive)
+
+    def _predict_step_direct_batch(
+        self, insample_y, insample_mask, hist_exog, futr_exog, stat_exog, y_idx
+    ):
+        windows_batch = dict(
+            insample_y=insample_y,
+            insample_mask=insample_mask,
+            futr_exog=futr_exog,
+            hist_exog=hist_exog,
+            stat_exog=stat_exog,
+        )
+        if self.series_state:
+            n_windows = insample_y.shape[0]
+            start = self._predict_hedge_cursor
+            weights = self._predict_hedge_weights[start : start + n_windows]
+            if weights.shape[0] != n_windows:
+                raise RuntimeError(
+                    "series_state predict window count does not match the fitted table"
+                )
+            self._predict_hedge_cursor = start + n_windows
+            windows_batch["hedge_weights"] = weights
+        output_batch = self(windows_batch)
+        output_batch = self.loss.domain_map(output_batch)
+        if self.loss.is_distribution_output:
+            y_loc, y_scale = self._get_loc_scale(y_idx)
+            distr_args = self.loss.scale_decouple(
+                output=output_batch, loc=y_loc, scale=y_scale
+            )
+            _, sample_mean, quants = self.loss.sample(distr_args=distr_args)
+            y_hat = torch.concat((sample_mean, quants), axis=-1)
+            if self.loss.return_params:
+                distr_args = torch.stack(distr_args, dim=-1)
+                if distr_args.ndim > 4:
+                    distr_args = distr_args.flatten(-2, -1)
+                y_hat = torch.concat((y_hat, distr_args), axis=-1)
+            return y_hat
+        return self._inv_normalization(y_hat=output_batch, y_idx=y_idx)
+
+    def _accumulate_series_state(self, batch, final_condition, w_idxs, per_window_losses):
+        global_idx = self._window_series_index(batch, final_condition, w_idxs)
+        losses = torch.stack(per_window_losses, dim=1).detach()
+        self.series_cumloss = self.series_cumloss.to(device=losses.device)
+        self.series_visits = self.series_visits.to(device=global_idx.device)
+        self.series_cumloss.index_add_(0, global_idx, losses)
+        self.series_visits.index_add_(
+            0,
+            global_idx,
+            torch.ones(global_idx.shape[0], dtype=torch.long, device=global_idx.device),
+        )
+
     def training_step(self, batch, batch_idx):
         if self.RECURRENT:
             self.h = self.h_train
@@ -431,6 +633,9 @@ class NSX(BaseModel):
             hist_exog=hist_exog,
             stat_exog=stat_exog,
         )
+        if self.series_state:
+            series_ids = self._window_series_index(batch, final_condition, w_idxs)
+            windows_batch["hedge_weights"] = self._hedge_weights(series_ids)
 
         # Get predictions and component analysis
         output, expert_outputs, gate_weights, mixture_weights = self(
@@ -467,7 +672,16 @@ class NSX(BaseModel):
         expert_losses_tensor = torch.stack(expert_losses)
         expert_loss = expert_losses_tensor.mean()
 
-        if self.online_eg:
+        if self.series_state:
+            if not per_window_losses:
+                raise ValueError("series_state requires a point forecast loss")
+            self._accumulate_series_state(
+                batch, final_condition, w_idxs, per_window_losses
+            )
+
+        if self.series_state:
+            pass
+        elif self.online_eg:
             eta, eg_grad, played_weights = self._eg_update(
                 y_hat=output,
                 y=outsample_y,
@@ -539,7 +753,7 @@ class NSX(BaseModel):
                 insample_y=insample_y,
             )
 
-        if self.online_eg:
+        if self.online_eg or self.series_state:
             total_loss = expert_loss + combined_loss
         elif self.specialize:
             total_loss = expert_loss + combined_loss + load_balance
@@ -568,7 +782,7 @@ class NSX(BaseModel):
                 )
         elif self.specialize:
             self.log("load_balance", load_balance.detach(), batch_size=outsample_y.size(0), on_epoch=True)
-        else:
+        elif not self.series_state:
             self.log("gate_loss", gate_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
 
         # Log individual expert losses and usage

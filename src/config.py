@@ -14,7 +14,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 DRY_RUN = False
 
-MAX_SAMPLES = 10
+MAX_SAMPLES = 20
 SEED = 123
 USE_MPS = _env_bool("USE_MPS", True)
 USE_CUDA = _env_bool("USE_CUDA", False)
