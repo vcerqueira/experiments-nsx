@@ -13,7 +13,18 @@ warnings.filterwarnings('ignore')
 NUM_EXPERTS = 10
 INPUT_SIZE_MULTIPLIER = 2
 MAX_STEPS = 1000
-ASSETS_PATH = Path('../../assets/experts')
+# ASSETS_PATH = Path(__file__).resolve().parents[2] / 'assets' / 'experts'
+ASSETS_PATH = Path('./assets/experts').resolve()
+
+
+def load_experts(dataset):
+    """Load the fitted NeuralForecast experts saved for this dataset name."""
+    path = ASSETS_PATH / dataset
+    if not (path / 'configuration.pkl').exists():
+        raise FileNotFoundError(f'No saved experts for dataset {dataset!r} in {path}')
+    return NeuralForecast.load(path=str(path))
+
+# load_experts('monash_m1_monthly')
 
 
 def build_mlp_experts(horizon, input_size):
