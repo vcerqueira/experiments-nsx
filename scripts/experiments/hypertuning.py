@@ -37,7 +37,7 @@ if __name__ == '__main__':
             df, horizon, n_lags, freq, seas_len = ChronosDataset.load_everything(
                 target,
                 min_n_instances=2 * (n_lags + horizon),
-            )
+            ) 
 
         cv_setup = {'val_size': horizon, 'test_size': horizon, 'step_size': 1, 'n_windows': None}
         train, _ = ChronosDataset.time_wise_split(df, horizon)

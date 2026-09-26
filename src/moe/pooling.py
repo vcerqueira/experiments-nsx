@@ -24,32 +24,35 @@ class SparsePooling(nn.Module):
         return gate_weights
 
 
-# class SoftPooling(nn.Module):
-#     """Temperature-scaled softmax over all experts."""
-#
-#     def __init__(self, temperature: float = 1.0):
-#         super().__init__()
-#         self.temperature = temperature
-#
-#     def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
-#         return F.softmax(gate_logits / self.temperature, dim=1)
+class StraightThroughPooling(nn.Module):
+    """Hard one-hot in the forward pass, softmax gradients in the backward pass."""
 
-#
-# class StraightThroughPooling(nn.Module):
-#     """Hard one-hot in the forward pass, softmax gradients in the backward pass."""
-#
-#     def __init__(self, temperature: float = 1.0, hard: bool = True):
-#         super().__init__()
-#         self.temperature = temperature
-#         self.hard = hard
-#
-#     def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
-#         gates_soft = F.softmax(gate_logits / self.temperature, dim=-1)
-#         if not self.hard:
-#             return gates_soft
-#
-#         gates_hard = F.one_hot(
-#             gates_soft.argmax(dim=-1),
-#             num_classes=gate_logits.size(-1),
-#         ).float()
-#         return (gates_hard - gates_soft).detach() + gates_soft
+    def __init__(self, temperature: float = 1.0, hard: bool = True):
+        super().__init__()
+        self.temperature = temperature
+        self.hard = hard
+
+    def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
+        gates_soft = F.softmax(gate_logits / self.temperature, dim=-1)
+        if not self.hard:
+            return gates_soft
+
+        gates_hard = F.one_hot(
+            gates_soft.argmax(dim=-1),
+            num_classes=gate_logits.size(-1),
+        ).float()
+        return (gates_hard - gates_soft).detach() + gates_soft
+
+
+POOLING_NAMES = ("dense", "sparse", "straight_through")
+
+
+def build_pooling(name: str, k: int) -> nn.Module:
+    if name == "dense":
+        return DensePooling()
+    if name == "sparse":
+        return SparsePooling(k=k)
+    if name == "straight_through":
+        return StraightThroughPooling()
+    expected = ", ".join(repr(item) for item in POOLING_NAMES)
+    raise ValueError(f"Unknown pooling={name!r}; expected {expected}")
