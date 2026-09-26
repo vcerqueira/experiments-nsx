@@ -71,7 +71,8 @@ class ConfigSampler:
                               input_size: int,
                               engine: str,
                               limit_epochs: bool = False,
-                              limit_val_batches: Optional[int] = None):
+                              limit_val_batches: Optional[int] = None,
+                              experts=None):
 
         model_config = copy.deepcopy(model_config)
 
@@ -95,6 +96,9 @@ class ConfigSampler:
 
         if limit_val_batches is not None:
             config['limit_val_batches'] = limit_val_batches
+
+        if experts is not None:
+            config['experts'] = experts
 
         model_instance = NSX(**config)
 

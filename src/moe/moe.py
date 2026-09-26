@@ -36,6 +36,8 @@ class NSX(BaseModel):
         input_size (int): Autoregressive lag window.
         loss (callable, optional): Training loss. Default is MAE().
         experts (list, optional): Expert modules. Built from ``expert_arch`` when omitted.
+        frozen_experts (bool, optional): Keep ``experts`` fixed and train only the
+            gate or mixture. Requires trained modules in ``experts``. Default False.
         num_experts (int, optional): Experts to build. Default 6.
         expert_arch (str, optional): ``mlp``, ``kan``, or ``nbeats``. Default ``mlp``.
         expert_kwargs (dict, optional): Extra expert constructor arguments.
@@ -55,6 +57,11 @@ class NSX(BaseModel):
         series_state (bool, optional): Per-series Hedge table. Default False.
         series_state_eta (float, optional): Hedge step size. Must be positive.
             Default 1.0.
+        frozen_loss (str, optional): Objective when ``frozen_experts`` is true
+            and routing is ordinary. ``gate_mixture`` uses ``gate_loss +
+            combined_loss``. ``gate`` uses ``gate_loss`` only. ``specialize``
+            keeps ``combined_loss + load_balance``. ``online_eg`` and
+            ``series_state`` keep ``combined_loss``. Default ``gate_mixture``.
         **trainer_kwargs: Remaining arguments are NeuralForecast ``BaseModel``
             training arguments (learning rate, batch size, scaler, and so on).
     """
@@ -107,7 +114,11 @@ class NSX(BaseModel):
                  load_balance_coef: float = 0.01,
                  series_state: bool = False,
                  series_state_eta: float = 1.0,
+                 frozen_experts: bool = False,
+                 frozen_loss: str = 'gate_mixture',
                  **trainer_kwargs):
+        if frozen_experts and not experts:
+            raise ValueError('frozen_experts=True requires trained modules in experts')
         self._validate_modes(
             k=k,
             pooling=pooling,
@@ -119,6 +130,7 @@ class NSX(BaseModel):
             series_state=series_state,
             series_state_eta=series_state_eta,
             loss=loss,
+            frozen_loss=frozen_loss,
         )
 
         super(NSX, self).__init__(h=h,
@@ -153,7 +165,8 @@ class NSX(BaseModel):
         self.h = h
 
         if experts is not None:
-            self.experts = experts if isinstance(experts, torch.nn.ModuleList) else torch.nn.ModuleList(experts)
+            self.experts = experts if isinstance(experts, torch.nn.ModuleList) else torch.nn.ModuleList(list(experts))
+            self._check_passed_experts()
         else:
             self.experts = build_experts(
                 h=self.h,
@@ -163,6 +176,12 @@ class NSX(BaseModel):
                 expert_kwargs=expert_kwargs,
                 random_seed=random_seed,
             )
+
+        self.frozen_experts = bool(frozen_experts)
+        if self.frozen_experts:
+            for parameter in self.experts.parameters():
+                parameter.requires_grad_(False)
+            self.experts.eval()
 
         self.num_experts = len(self.experts)
         if self.num_experts < 1:
@@ -178,6 +197,7 @@ class NSX(BaseModel):
         self.load_balance_coef = float(load_balance_coef)
         self.series_state = bool(series_state)
         self.series_state_eta = float(series_state_eta)
+        self.frozen_loss = frozen_loss
         self._val_hedge_weights = None
         self._val_hedge_cursor = 0
         self._predict_hedge_weights = None
@@ -188,6 +208,39 @@ class NSX(BaseModel):
                 parameter.requires_grad_(False)
         if self.online_eg:
             self.eg = ExponentiatedGradient(self.num_experts)
+
+        # online_eg and series_state learn by updating buffers in training_step.
+        # With frozen experts the gate is frozen too, so Adam would receive no
+        # parameters. This scalar keeps the trainer alive and does not affect the forecast.
+        self._frozen_placeholder = None
+        if self.frozen_experts and not any(parameter.requires_grad for parameter in self.parameters()):
+            self._frozen_placeholder = torch.nn.Parameter(torch.zeros(()))
+
+    def _check_passed_experts(self):
+        for index, expert in enumerate(self.experts):
+            if expert.h != self.h or expert.input_size != self.input_size:
+                raise ValueError(
+                    f"expert {index} was built with h={expert.h}, input_size={expert.input_size}; "
+                    f"NSX has h={self.h}, input_size={self.input_size}"
+                )
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.frozen_experts:
+            self.experts.eval()
+        return self
+
+    def configure_optimizers(self):
+        if not self.frozen_experts:
+            return super().configure_optimizers()
+        parameters = self.parameters
+        self.parameters = lambda recurse=True: (
+            parameter for parameter in parameters(recurse) if parameter.requires_grad
+        )
+        try:
+            return super().configure_optimizers()
+        finally:
+            self.parameters = parameters
 
     @staticmethod
     def _validate_modes(
@@ -201,6 +254,7 @@ class NSX(BaseModel):
         series_state,
         series_state_eta,
         loss,
+        frozen_loss,
     ):
         if k < 1:
             raise ValueError(f"k must be >= 1, got {k}")
@@ -237,6 +291,10 @@ class NSX(BaseModel):
             raise ValueError(
                 "online_eg requires MAE so the gate update is the absolute-loss subgradient"
             )
+        if frozen_loss not in ("gate_mixture", "gate"):
+            raise ValueError(
+                f"Unknown frozen_loss={frozen_loss!r}; expected 'gate_mixture' or 'gate'"
+            )
 
     def forward(self, windows_batch: dict, return_components: bool = False):
         """
@@ -272,13 +330,11 @@ class NSX(BaseModel):
             # still see every expert through full_gate_weights.
             gate_weights = self.pooling(gate_logits)
 
-        expert_outputs = []
-        for expert_module in self.experts:
-            expert_output = expert_module(windows_batch)
-            if expert_output.ndim == 3:
-                expert_output = expert_output.squeeze(-1)
-            expert_outputs.append(expert_output)
-        expert_outputs = torch.stack(expert_outputs, dim=1)  # [B, E, h]
+        if self.frozen_experts:
+            with torch.no_grad():
+                expert_outputs = self._run_experts(windows_batch)
+        else:
+            expert_outputs = self._run_experts(windows_batch)
 
         combined_output = (expert_outputs * gate_weights.unsqueeze(-1)).sum(dim=1)
         combined_output = combined_output.unsqueeze(-1)  # [B, h, 1] for NeuralForecast
@@ -286,6 +342,15 @@ class NSX(BaseModel):
         if return_components:
             return combined_output, expert_outputs, full_gate_weights, gate_weights
         return combined_output
+
+    def _run_experts(self, windows_batch):
+        expert_outputs = []
+        for expert_module in self.experts:
+            expert_output = expert_module(windows_batch)
+            if expert_output.ndim == 3:
+                expert_output = expert_output.squeeze(-1)
+            expert_outputs.append(expert_output)
+        return torch.stack(expert_outputs, dim=1)  # [B, E, h]
 
     def _is_validating(self):
         trainer = getattr(self, "_trainer", None)
@@ -528,7 +593,18 @@ class NSX(BaseModel):
                 insample_y=insample_y,
             )
 
-        if self.online_eg or self.series_state:
+        if self.frozen_experts:
+            # Expert weights are fixed, so expert_loss cannot train them. It
+            # stays in the logs because the gate target is built from it.
+            if self.online_eg or self.series_state:
+                total_loss = combined_loss
+            elif self.specialize:
+                total_loss = combined_loss + load_balance
+            elif self.frozen_loss == "gate":
+                total_loss = gate_loss
+            else:
+                total_loss = gate_loss + combined_loss
+        elif self.online_eg or self.series_state:
             total_loss = expert_loss + combined_loss
         elif self.specialize:
             total_loss = expert_loss + combined_loss + load_balance
@@ -569,6 +645,9 @@ class NSX(BaseModel):
                 batch_size=outsample_y.size(0),
                 on_epoch=True,
             )
+
+        if self._frozen_placeholder is not None:
+            total_loss = total_loss + self._frozen_placeholder * 0
 
         if torch.isnan(total_loss):
             print("Model Parameters", self.hparams)

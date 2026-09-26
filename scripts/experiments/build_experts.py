@@ -13,8 +13,8 @@ warnings.filterwarnings('ignore')
 NUM_EXPERTS = 10
 INPUT_SIZE_MULTIPLIER = 2
 MAX_STEPS = 1000
-# ASSETS_PATH = Path(__file__).resolve().parents[2] / 'assets' / 'experts'
-ASSETS_PATH = Path('./assets/experts').resolve()
+ASSETS_PATH = Path(__file__).resolve().parents[2] / 'assets' / 'experts'
+# ASSETS_PATH = Path('./assets/experts').resolve()
 
 
 def load_experts(dataset):
