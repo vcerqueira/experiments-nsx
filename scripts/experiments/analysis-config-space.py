@@ -8,9 +8,13 @@ from src.moe.config_pool import CONFIG_POOL
 
 # RESULTS_PATH = Path(__file__).resolve().parents[2] / 'assets' / 'results'
 RESULTS_PATH = Path('./assets/results')
+# Set True to analyse the pretrained-expert runs in NSX-frozen result files.
+FROZEN = False
+
+model_name = 'NSX-frozen' if FROZEN else 'NSX'
 
 configs = ConfigSampler.generate_samples(
-    config_pool=CONFIG_POOL['NSX'],
+    config_pool=CONFIG_POOL[model_name],
     num_samples=N_SAMPLES,
     random_state=SEED,
     return_df=True,
@@ -18,7 +22,7 @@ configs = ConfigSampler.generate_samples(
 configs = configs[~configs.index.duplicated(keep='first')]
 
 rows = []
-for fp in sorted(RESULTS_PATH.glob('NSX,*,*.csv')):
+for fp in sorted(RESULTS_PATH.glob(f'{model_name},*,*.csv')):
     _, config_id, target = fp.stem.split(',', 2)
     score = pd.read_csv(fp)
     # NaN-loss runs are written as Overall,"" instead of a float.
@@ -43,7 +47,8 @@ print(results['Overall'].isna().mean())
 
 results.groupby('scaler_type').median(numeric_only=True)
 results.groupby('max_steps').median(numeric_only=True)
-results.groupby('num_experts').median(numeric_only=True)
+if 'num_experts' in results.columns:
+    results.groupby('num_experts').median(numeric_only=True)
 print(results.groupby('pooling').mean(numeric_only=True)['Overall'])
 print(results.groupby('pooling').mean(numeric_only=True)['Overall'])
 results.groupby('pooling').median(numeric_only=True)
