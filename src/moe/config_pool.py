@@ -32,14 +32,15 @@ CONFIG_POOL = {
         "series_state": tune.choice([False, True]),
         "series_gate": tune.choice([False, True]),
         "disagreement_scale": tune.choice([0.0, 1.0]),
-        "specialize": tune.choice([False, True]),
+        # "specialize": tune.choice([False, True]),
+        "specialize": tune.choice([False]),
         "gate_loss_type": tune.choice(
             [
                 "ib_softmax_mse",
-                "softmax_mse",
-                "ib_softmax_mse_grad",
+                # "softmax_mse",
+                # "ib_softmax_mse_grad",
                 "ib_softmax_mse_window",
-                "ib_softmax_mse_grad_window",
+                # "ib_softmax_mse_grad_window",
             ]
         ),
     },

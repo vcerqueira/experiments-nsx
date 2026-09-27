@@ -357,7 +357,11 @@ class NSX(BaseModel):
 
     def _is_validating(self):
         trainer = getattr(self, "_trainer", None)
-        return trainer is not None and bool(getattr(trainer, "validating", False))
+        if trainer is None:
+            return False
+        # The sanity check runs this same validation loop with the stage set to
+        # SANITY_CHECKING, so trainer.validating is false there.
+        return bool(trainer.validating or trainer.sanity_checking)
 
     def on_fit_start(self):
         super().on_fit_start()
