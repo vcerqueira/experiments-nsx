@@ -29,8 +29,9 @@ CONFIG_POOL = {
         "k": tune.choice([4]),
         "gate": tune.choice(["linear_bias"]),
         # "gate": tune.choice(["linear", "linear_bias", "mlp"]),
-        "online_eg": tune.choice([False, True]),
         "series_state": tune.choice([False, True]),
+        "series_gate": tune.choice([False, True]),
+        "disagreement_scale": tune.choice([0.0, 1.0]),
         "specialize": tune.choice([False, True]),
         "gate_loss_type": tune.choice(
             [
@@ -55,8 +56,9 @@ CONFIG_POOL = {
         "pooling": tune.choice(["sparse"]),
         "k": tune.choice([4]),
         "gate": tune.choice(["linear_bias"]),
-        "online_eg": tune.choice([False, True]),
         "series_state": tune.choice([False, True]),
+        "series_gate": tune.choice([False, True]),
+        "disagreement_scale": tune.choice([0.0, 1.0]),
         "specialize": tune.choice([False, True]),
         "gate_loss_type": tune.choice(
             [
