@@ -49,12 +49,14 @@ CONFIG_POOL = {
         "scaler_type": tune.choice(["standard"]),
         "max_steps": tune.choice([2000]),
         "batch_size": tune.choice([128]),
-        "windows_batch_size": tune.choice([256]),
+        "windows_batch_size": tune.choice([256, 64]),
         "random_seed": tune.choice([18]),
         "pooling": tune.choice(["sparse"]),
         "k": tune.choice([4]),
-        "gate": tune.choice(["linear_bias"]),
-        "series_state": tune.choice([False, True]),
+        "gate": tune.choice(["linear_bias",'mlp']),
+        "series_state": tune.choice([False]),
+        "series_state_train_only": tune.choice([False]),
+        # "series_state_eta": tune.choice([0.1, 1.0, 5.0]),
         "disagreement_scale": tune.choice([0.0]),
         "gate_loss_type": tune.choice(
             [
@@ -65,7 +67,7 @@ CONFIG_POOL = {
                 "ib_softmax_mse_grad_window",
             ]
         ),
-        "frozen_loss": tune.choice(["gate_mixture", "gate"]),
+        "frozen_loss": tune.choice(["gate_mixture"]),
         "frozen_experts": True,
     },
 }

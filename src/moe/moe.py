@@ -51,6 +51,9 @@ class NSX(BaseModel):
             trained gate logits. Default False.
         series_state_eta (float, optional): Hedge step size. Must be positive.
             Default 1.0.
+        series_state_train_only (bool, optional): Add the Hedge scores only
+            during training. Validation and predict then use the gate on the
+            input window alone. Default False.
         disagreement_scale (float, optional): Soften the combined mixture by
             ``1 + scale *`` total variation between the gate and the series
             prior. Requires ``series_state`` when positive. Default 0.
@@ -106,6 +109,7 @@ class NSX(BaseModel):
                  gate_loss_type: str = 'ib_softmax_mse',
                  series_state: bool = False,
                  series_state_eta: float = 1.0,
+                 series_state_train_only: bool = False,
                  disagreement_scale: float = 0.0,
                  frozen_experts: bool = False,
                  frozen_loss: str = 'gate_mixture',
@@ -184,6 +188,7 @@ class NSX(BaseModel):
         self.gate_loss_type = gate_loss_type
         self.series_state = bool(series_state)
         self.series_state_eta = float(series_state_eta)
+        self.series_state_train_only = bool(series_state_train_only)
         self.disagreement_scale = float(disagreement_scale)
         self.frozen_loss = frozen_loss
         self._val_hedge_weights = None
@@ -272,12 +277,12 @@ class NSX(BaseModel):
         """
         insample_y = windows_batch['insample_y']  # [B, L] or [B, L, 1]
         series_prior = windows_batch.get("series_scores")
-        if self.series_state and self._is_validating() and series_prior is None:
+        if self._use_series_prior() and self._is_validating() and series_prior is None:
             # Validation does not pass the table. Consume the rows armed for
             # this batch. Predict passes them explicitly so extra explain
             # forwards cannot walk the same cursor.
             series_prior = consume_validation(self, insample_y.shape[0])
-        if self.series_state:
+        if self._use_series_prior():
             if series_prior is None:
                 raise RuntimeError("series_state requires series scores on the batch")
             gate_logits = self.gate(insample_y.squeeze(-1))
@@ -313,6 +318,14 @@ class NSX(BaseModel):
             expert_outputs.append(expert_output)
         return torch.stack(expert_outputs, dim=1)  # [B, E, h]
 
+    def _use_series_prior(self):
+        """Hedge scores shift the gate. Train-only mode keeps that shift inside training."""
+        if not self.series_state:
+            return False
+        if self.series_state_train_only and not self.training:
+            return False
+        return True
+
     def _is_validating(self):
         trainer = getattr(self, "_trainer", None)
         if trainer is None:
@@ -328,17 +341,21 @@ class NSX(BaseModel):
         prepare_fit(self)
 
     def on_validation_batch_start(self, batch, batch_idx, dataloader_idx=0):
-        if not self.series_state or getattr(self, "val_size", 0) == 0:
+        if (
+            not self.series_state
+            or self.series_state_train_only
+            or getattr(self, "val_size", 0) == 0
+        ):
             return
         arm_validation(self, batch)
 
     def predict(self, dataset, **kwargs):
-        if self.series_state:
+        if self.series_state and not self.series_state_train_only:
             dataset = wrap_predict_dataset(dataset)
         return super().predict(dataset, **kwargs)
 
     def _predict_step_direct(self, batch, batch_idx, recursive=False):
-        if self.series_state and not recursive:
+        if self.series_state and not self.series_state_train_only and not recursive:
             arm_predict(self, batch)
         return super()._predict_step_direct(batch, batch_idx, recursive=recursive)
 
@@ -355,7 +372,7 @@ class NSX(BaseModel):
             hist_exog=hist_exog,
             stat_exog=stat_exog,
         )
-        if self.series_state:
+        if self.series_state and not self.series_state_train_only:
             windows_batch["series_scores"] = consume_predict(self, insample_y.shape[0])
         output_batch = self(windows_batch)
         output_batch = self.loss.domain_map(output_batch)

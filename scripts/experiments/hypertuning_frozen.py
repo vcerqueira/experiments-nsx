@@ -32,6 +32,7 @@ def error_frame(scored, train, seas_len):
     )
     return pd.DataFrame(radar.evaluate()).T
 
+
 if __name__ == '__main__':
     print(RESULTS_PATH.absolute())
 
@@ -56,7 +57,7 @@ if __name__ == '__main__':
 
         models = BaseModelsConfig.get_nf_models(
             horizon=horizon,
-            input_size=n_lags*2,
+            input_size=n_lags * 2,
             engine=ENGINE,
             limit_epochs=LIMIT_EPOCHS,
         )
@@ -92,11 +93,11 @@ if __name__ == '__main__':
             try:
                 experts_ = copy.deepcopy(experts)
                 model = ConfigSampler.create_model_instance(model_config=config_sample,
-                                                        horizon=horizon,
-                                                        input_size=n_lags,
-                                                        engine=ENGINE,
-                                                        limit_epochs=LIMIT_EPOCHS,
-                                                        experts=experts_)
+                                                            horizon=horizon,
+                                                            input_size=n_lags,
+                                                            engine=ENGINE,
+                                                            limit_epochs=LIMIT_EPOCHS,
+                                                            experts=experts_)
             except ValueError as e:
                 print(f"Skipping invalid config {cfg_id}: {e}")
                 continue
