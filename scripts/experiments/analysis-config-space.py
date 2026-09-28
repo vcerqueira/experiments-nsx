@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import N_SAMPLES, SEED
+from src.config import DATASETS, N_SAMPLES, SEED
 from src.hypertuning import ConfigSampler
 from src.moe.config_pool import CONFIG_POOL
 
@@ -119,4 +119,86 @@ print("\n\n\n\n\n\n\n\n\n")
 print(results.sort_values('Overall').iloc[:,-4:])
 print("\n\n\n")
 print(effects.drop(columns='gap').to_string(index=False))
+
+
+def _dataset_order(targets):
+    order = {name: index for index, name in enumerate(DATASETS)}
+    return targets.map(lambda target: order.get(target, len(order)))
+
+
+def _pick_configuration(group, how):
+    """One result row. ``how`` is ``best`` (lowest score) or ``median``."""
+    finite = group.dropna(subset=['Overall'])
+    if finite.empty:
+        return group.iloc[0]
+    if how == 'best':
+        return finite.sort_values(['Overall', 'config_id']).iloc[0]
+    median_value = finite['Overall'].median()
+    distance = (finite['Overall'] - median_value).abs()
+    # Equidistant rows take the worse score, so an even count does not
+    # report a configuration better than the median.
+    ranked = finite.assign(_distance=distance).sort_values(
+        ['_distance', 'Overall', 'config_id'],
+        ascending=[True, False, True],
+    )
+    return ranked.iloc[0]
+
+
+def _configuration_table(frame, how, baseline_columns):
+    chosen = [
+        _pick_configuration(group, how)
+        for _, group in frame.groupby('target', sort=False)
+    ]
+    table = pd.DataFrame(chosen).reset_index(drop=True)
+    counts = frame.groupby('target')['Overall'].apply(lambda scores: int(scores.notna().sum()))
+    table.insert(1, 'n', table['target'].map(counts).astype('Int64'))
+    others = table[baseline_columns]
+    has_other = others.notna().any(axis=1)
+    table['best_other'] = others.min(axis=1, skipna=True).where(has_other)
+    table['best_other_model'] = pd.Series(pd.NA, index=table.index, dtype='object')
+    if has_other.any():
+        table.loc[has_other, 'best_other_model'] = others.loc[has_other].idxmin(axis=1)
+    table['gap'] = table['Overall'] - table['best_other']
+    table['_order'] = _dataset_order(table['target'])
+    return table.sort_values(['_order', 'target']).drop(columns='_order').reset_index(drop=True)
+
+
+def _print_baseline_comparison(table, how, baseline_columns):
+    label = 'Best' if how == 'best' else 'Median'
+    score_name = f'NSX {how}'
+    shown = table.rename(columns={'Overall': score_name})
+    compact = [
+        'target', 'n', 'config_id', score_name,
+        'best_other', 'best_other_model', 'gap',
+    ]
+    print(f'\n{label} NSX configuration against the best other model in the same file')
+    print('Other models are the columns of that file. A dataset can have different baseline scores across files.')
+    print('gap is NSX minus the best of those columns. A negative gap means NSX is more accurate.')
+    print(shown[compact].to_string(index=False))
+
+    wide_columns = ['target', 'config_id', score_name, *baseline_columns]
+    print(f'\n{label} NSX configuration and the other models in the same file')
+    print(shown[wide_columns].to_string(index=False))
+
+    shared = shown.dropna(subset=[score_name])
+    shared = shared.loc[shared[baseline_columns].notna().any(axis=1)]
+    if shared.empty:
+        return
+    score_columns = [score_name, *baseline_columns]
+    print(f'\nMean score on {len(shared)} datasets with a finite {label.lower()} NSX and another model')
+    print(shared[score_columns].mean().sort_values().to_string())
+    print('\nAverage rank on those datasets')
+    ranks = shared[score_columns].rank(axis=1, method='min', ascending=True, na_option='keep')
+    print(ranks.mean().sort_values().to_string())
+    wins = int((shared['gap'] < 0).sum())
+    print(f'\n{label} NSX beats the best other model on {wins} of {len(shared)} datasets')
+
+
+if IS_VECTOR and baseline_columns:
+    pd.set_option('display.width', 200)
+    pd.set_option('display.float_format', lambda value: f'{value:.3f}')
+    vector_results = results.reset_index()
+    for selection in ('best', 'median'):
+        comparison = _configuration_table(vector_results, selection, baseline_columns)
+        _print_baseline_comparison(comparison, selection, baseline_columns)
 

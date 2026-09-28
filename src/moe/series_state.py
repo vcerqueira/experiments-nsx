@@ -150,10 +150,6 @@ def series_scores(model, series_index):
     return scores.detach()
 
 
-def hedge_weights(model, series_index):
-    return torch.softmax(series_scores(model, series_index), dim=-1)
-
-
 def _series_major(model, series_idx, windows_per_serie, values_fn):
     n_series = series_idx.shape[0]
     if windows_per_serie < 1 or n_series == 0:
@@ -165,10 +161,6 @@ def _series_major(model, series_idx, windows_per_serie, values_fn):
     return values_fn(model, series)
 
 
-def series_major_weights(model, series_idx, windows_per_serie):
-    return _series_major(model, series_idx, windows_per_serie, hedge_weights)
-
-
 def series_major_scores(model, series_idx, windows_per_serie):
     return _series_major(model, series_idx, windows_per_serie, series_scores)
 
@@ -177,8 +169,7 @@ def arm_predict(model, batch):
     if "series_idx" not in batch:
         raise RuntimeError("series_state predict requires series_idx on the batch")
     windows_per_serie = predict_windows_per_serie(model, batch)
-    reader = series_major_scores if model.series_gate else series_major_weights
-    model._predict_hedge_weights = reader(
+    model._predict_hedge_weights = series_major_scores(
         model, batch["series_idx"], windows_per_serie
     )
     model._predict_hedge_cursor = 0
@@ -188,8 +179,7 @@ def arm_validation(model, batch):
     if "series_idx" not in batch:
         raise RuntimeError("series_state validation requires series_idx on the batch")
     windows_per_serie = validation_windows_per_serie(model, batch)
-    reader = series_major_scores if model.series_gate else series_major_weights
-    model._val_hedge_weights = reader(
+    model._val_hedge_weights = series_major_scores(
         model, batch["series_idx"], windows_per_serie
     )
     model._val_hedge_cursor = 0

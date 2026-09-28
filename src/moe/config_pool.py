@@ -30,10 +30,7 @@ CONFIG_POOL = {
         "gate": tune.choice(["linear_bias"]),
         # "gate": tune.choice(["linear", "linear_bias", "mlp"]),
         "series_state": tune.choice([False, True]),
-        "series_gate": tune.choice([False, True]),
         "disagreement_scale": tune.choice([0.0, 1.0]),
-        # "specialize": tune.choice([False, True]),
-        "specialize": tune.choice([False]),
         "gate_loss_type": tune.choice(
             [
                 "ib_softmax_mse",
@@ -50,7 +47,7 @@ CONFIG_POOL = {
         "input_size_multiplier": tune.choice([2]),
         "learning_rate": tune.choice([0.001]),
         "scaler_type": tune.choice(["standard"]),
-        "max_steps": tune.choice([2500]),
+        "max_steps": tune.choice([2000]),
         "batch_size": tune.choice([128]),
         "windows_batch_size": tune.choice([256]),
         "random_seed": tune.choice([18]),
@@ -58,16 +55,14 @@ CONFIG_POOL = {
         "k": tune.choice([4]),
         "gate": tune.choice(["linear_bias"]),
         "series_state": tune.choice([False, True]),
-        "series_gate": tune.choice([False, True]),
         "disagreement_scale": tune.choice([0.0]),
-        "specialize": tune.choice([False, True]),
         "gate_loss_type": tune.choice(
             [
-                "ib_softmax_mse",
                 # "softmax_mse",
-                "ib_softmax_mse_grad",
-                # "ib_softmax_mse_window",
-                # "ib_softmax_mse_grad_window",
+                # "ib_softmax_mse",
+                # "ib_softmax_mse_grad",
+                "ib_softmax_mse_window",
+                "ib_softmax_mse_grad_window",
             ]
         ),
         "frozen_loss": tune.choice(["gate_mixture", "gate"]),
