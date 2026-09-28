@@ -1,5 +1,6 @@
 from pprint import pprint
 import warnings
+import copy
 from functools import partial
 from pathlib import Path
 
@@ -12,13 +13,24 @@ from metaforecast.evaluation import ModelRadar
 from utilsforecast.losses import mase
 
 from build_experts import load_experts
+from build_sota import load_sota
 from src.moe.config_pool import CONFIG_POOL
+from src.neuralnets import BaseModelsConfig
 from src.hypertuning import ConfigSampler
 from src.config import SEED, N_SAMPLES, MAX_SAMPLES, ENGINE, LIMIT_EPOCHS, DATASETS, LH_DATASETS
 
 warnings.filterwarnings('ignore')
 
 RESULTS_PATH = Path('../../assets/results')
+
+
+def error_frame(scored, train, seas_len):
+    radar = ModelRadar(
+        cv_df=scored,
+        metrics=[partial(mase, seasonality=seas_len)],
+        train_df=train,
+    )
+    return pd.DataFrame(radar.evaluate()).T
 
 if __name__ == '__main__':
     print(RESULTS_PATH.absolute())
@@ -40,9 +52,19 @@ if __name__ == '__main__':
                 min_n_instances=2 * (n_lags + horizon),
             )
 
-        cv_setup = {'val_size': horizon, 'test_size': horizon, 'step_size': 1, 'n_windows': None}
-        train, _ = ChronosDataset.time_wise_split(df, horizon)
-        experts = load_experts(target).models
+        train, test = ChronosDataset.time_wise_split(df, horizon)
+
+        models = BaseModelsConfig.get_nf_models(
+            horizon=horizon,
+            input_size=n_lags*2,
+            engine=ENGINE,
+            limit_epochs=LIMIT_EPOCHS,
+        )
+        nfe = NeuralForecast(models=models, freq=freq)
+        nfe.fit(df=train, val_size=horizon)
+        sota_fcst = nfe.predict()
+
+        experts = copy.deepcopy(nfe.models)
 
         config_list = ConfigSampler.generate_samples(config_pool=config_pool,
                                                      num_samples=N_SAMPLES,
@@ -68,32 +90,22 @@ if __name__ == '__main__':
 
             print(f"Running config {n_configs} / {MAX_SAMPLES}")
             try:
+                experts_ = copy.deepcopy(experts)
                 model = ConfigSampler.create_model_instance(model_config=config_sample,
                                                         horizon=horizon,
                                                         input_size=n_lags,
                                                         engine=ENGINE,
                                                         limit_epochs=LIMIT_EPOCHS,
-                                                        experts=experts)
+                                                        experts=experts_)
             except ValueError as e:
                 print(f"Skipping invalid config {cfg_id}: {e}")
                 continue
 
-            try:
-                nf = NeuralForecast(models=[model], freq=freq)
-                cv = nf.cross_validation(df=df, **cv_setup)
-
-                radar_outer = ModelRadar(
-                    cv_df=cv,
-                    metrics=[partial(mase, seasonality=seas_len)],
-                    train_df=train,
-                )
-
-                err_outer = radar_outer.evaluate()
-            except Exception as e:
-                if "Loss is NaN, training stopped." not in str(e):
-                    raise
-                print(f"Loss is NaN on {target},{cfg_id}")
-                err_outer = pd.Series([float("nan")], name="Overall")
+            nf = NeuralForecast(models=[model], freq=freq)
+            nf.fit(df=train)
+            fcst = nf.predict().merge(sota_fcst, on=['unique_id', 'ds'])
+            scored = test.merge(fcst, on=['unique_id', 'ds'], how='left')
+            err_outer = error_frame(scored, train, seas_len)
 
             print(err_outer)
 

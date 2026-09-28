@@ -9,7 +9,10 @@ from src.moe.config_pool import CONFIG_POOL
 # RESULTS_PATH = Path(__file__).resolve().parents[2] / 'assets' / 'results'
 RESULTS_PATH = Path('./assets/results')
 # Set True to analyse the pretrained-expert runs in NSX-frozen result files.
-FROZEN = False
+FROZEN = True
+# Set True when each result file is one row of model scores, with NSX as the
+# configured model and the remaining columns as fixed baselines.
+IS_VECTOR = True
 
 model_name = 'NSX-frozen' if FROZEN else 'NSX'
 
@@ -22,11 +25,16 @@ configs = ConfigSampler.generate_samples(
 configs = configs[~configs.index.duplicated(keep='first')]
 
 rows = []
+baseline_columns = []
 for fp in sorted(RESULTS_PATH.glob(f'{model_name},*,*.csv')):
     _, config_id, target = fp.stem.split(',', 2)
     score = pd.read_csv(fp)
-    # NaN-loss runs are written as Overall,"" instead of a float.
+    # NaN-loss runs are written as empty cells instead of a float.
     score = score.apply(pd.to_numeric, errors='coerce')
+    if IS_VECTOR:
+        if not baseline_columns:
+            baseline_columns = [column for column in score.columns if column != 'NSX']
+        score = score.rename(columns={'NSX': 'Overall'})
     score.insert(0, 'config_id', config_id)
     score.insert(1, 'target', target)
     rows.append(score)
@@ -64,8 +72,9 @@ results.iloc[0]
 
 base_rate = results['Overall'].isna().mean()
 
+score_skip = ['Overall', *baseline_columns]
 nan_rates = []
-for column in results.columns.drop('Overall'):
+for column in results.columns.drop(score_skip):
     if results[column].nunique(dropna=False) > 25:
         continue
     grouped = results.groupby(column, dropna=False)['Overall']
@@ -85,7 +94,7 @@ global_median = results['Overall'].median()
 # Range index: config_id repeats once per dataset, and a Series grouper
 # aligned on that index does not count result files.
 work = results.reset_index(drop=True)
-for column in work.columns.drop(['Overall']):
+for column in work.columns.drop(score_skip):
     series = work[column]
     if series.nunique(dropna=False) > 25:
         groups = pd.qcut(series, q=4, duplicates='drop')

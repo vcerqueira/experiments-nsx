@@ -15,6 +15,17 @@ from neuralforecast.auto import (AutoNBEATS,
                                  AutoTFT,
                                  AutoDeepNPTS)
 
+from neuralforecast.models import (NBEATS,
+                                   TiDE,
+                                   NLinear,
+                                   KAN,
+                                   MLP,
+                                   DLinear,
+                                   NHITS,
+                                   PatchTST,
+                                   TFT,
+                                   DeepNPTS)
+
 
 class ModelsConfig:
     AUTO_MODEL_CLASSES = {
@@ -65,6 +76,43 @@ class ModelsConfig:
                         brackets=1,
                     )
                 ),
+            )
+
+            models.append(model_instance)
+
+        return models
+
+
+class BaseModelsConfig:
+    MODEL_CLASSES = {
+        'TFT': TFT,
+        'NBEATS': NBEATS,
+        'TiDE': TiDE,
+        'NLinear': NLinear,
+        'KAN': KAN,
+        'MLP': MLP,
+        'DLinear': DLinear,
+        'NHITS': NHITS,
+        'DeepNPTS': DeepNPTS,
+        'PatchTST': PatchTST,
+    }
+
+    @classmethod
+    def get_nf_models(cls,
+                      horizon: int,
+                      input_size: int,
+                      engine: str = 'cpu',
+                      limit_epochs: bool = False):
+
+        models = []
+        for mod_name, mod in cls.MODEL_CLASSES.items():
+            max_steps_ = 2 if limit_epochs else 1000
+
+            model_instance = mod(
+                h=horizon,
+                input_size=input_size,
+                accelerator=engine,
+                max_steps=max_steps_,
             )
 
             models.append(model_instance)
