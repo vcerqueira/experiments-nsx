@@ -9,10 +9,10 @@ from src.moe.config_pool import CONFIG_POOL
 # RESULTS_PATH = Path(__file__).resolve().parents[2] / 'assets' / 'results'
 RESULTS_PATH = Path('./assets/results')
 # Set True to analyse the pretrained-expert runs in NSX-frozen result files.
-FROZEN = True
+FROZEN = False
 # Set True when each result file is one row of model scores, with NSX as the
 # configured model and the remaining columns as fixed baselines.
-IS_VECTOR = True
+IS_VECTOR = False
 
 model_name = 'NSX-frozen' if FROZEN else 'NSX'
 
