@@ -44,7 +44,7 @@ class StraightThroughPooling(nn.Module):
         return (gates_hard - gates_soft).detach() + gates_soft
 
 
-POOLING_NAMES = ("dense", "sparse", "straight_through")
+POOLING_NAMES = ("dense", "sparse")
 
 
 def build_pooling(name: str, k: int) -> nn.Module:
@@ -52,7 +52,6 @@ def build_pooling(name: str, k: int) -> nn.Module:
         return DensePooling()
     if name == "sparse":
         return SparsePooling(k=k)
-    if name == "straight_through":
-        return StraightThroughPooling()
+
     expected = ", ".join(repr(item) for item in POOLING_NAMES)
     raise ValueError(f"Unknown pooling={name!r}; expected {expected}")
