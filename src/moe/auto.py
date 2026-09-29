@@ -116,11 +116,37 @@ class AutoNSX(BaseAuto):
         return _maybe_optuna(config, backend)
 
 
+def _store_experts(experts):
+    """Park pretrained modules in the Ray object store.
+
+    Tune pickles ``AutoNSXFrozen`` into every trial actor, because
+    ``BaseAuto._train_tune`` is a bound method. Fitted experts are larger than
+    Ray's function-size limit; the actor has to capture an ``ObjectRef``.
+    """
+    import ray
+    from ray import ObjectRef
+
+    if isinstance(experts, ObjectRef):
+        return experts
+    return ray.put(experts)
+
+
+def _load_experts(experts):
+    import ray
+    from ray import ObjectRef
+
+    if isinstance(experts, ObjectRef):
+        return ray.get(experts)
+    return experts
+
+
 class AutoNSXFrozen(BaseAuto):
     """Automatic hyperparameter optimization for ``NSXFrozen``.
 
     ``experts`` are fixed pretrained modules. Every trial uses their ``h`` and
     ``input_size``, so the search covers the gate and the training knobs only.
+    With the Ray backend those modules live in the object store, not on this
+    instance, so trial actors stay under Ray's function-size limit.
     """
 
     default_config = {
@@ -151,6 +177,10 @@ class AutoNSXFrozen(BaseAuto):
         input_size = _frozen_input_size(experts, h)
         if config is None:
             config = self.get_default_config(h=h, backend=backend)
+        if backend == "ray":
+            # Lightning deepcopies every constructor local into ``_hparams_initial``.
+            # The name has to already be an ObjectRef before ``super().__init__``.
+            experts = _store_experts(experts)
         config = _fix_frozen_config(config, experts, input_size)
 
         super(AutoNSXFrozen, self).__init__(
@@ -176,6 +206,21 @@ class AutoNSXFrozen(BaseAuto):
     @classmethod
     def get_default_config(cls, h, backend, n_series=None):
         return _maybe_optuna(cls.default_config.copy(), backend)
+
+    def _fit_model(
+        self, cls_model, config, dataset, val_size, test_size, distributed_config=None
+    ):
+        if isinstance(config, dict) and "experts" in config:
+            config = dict(config)
+            config["experts"] = _load_experts(config["experts"])
+        return super()._fit_model(
+            cls_model=cls_model,
+            config=config,
+            dataset=dataset,
+            val_size=val_size,
+            test_size=test_size,
+            distributed_config=distributed_config,
+        )
 
 
 def _frozen_input_size(experts, h):
