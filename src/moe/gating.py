@@ -5,34 +5,17 @@ from neuralforecast.common._modules import MLP as MLPLayer
 
 GATE_NAMES = ("linear", "linear_bias", "mlp")
 
-# Grad targets are -residual * feature.
-# residual: sign(mixture - y), or the residual itself.
-# feature: expert forecast, expert - y, or expert - mixture.
-_GRAD_GATE_SPECS = {
-    "ib_softmax_mse_grad": ("sign", "level", False),
-    "ib_softmax_mse_grad_window": ("sign", "level", True),
-    "ib_softmax_mse_grad_error": ("sign", "error", False),
-    "ib_softmax_mse_grad_error_window": ("sign", "error", True),
-    "ib_softmax_mse_grad_advantage": ("sign", "advantage", False),
-    "ib_softmax_mse_grad_advantage_window": ("sign", "advantage", True),
-    "ib_softmax_mse_grad_resid": ("value", "level", False),
-    "ib_softmax_mse_grad_resid_window": ("value", "level", True),
-    "ib_softmax_mse_grad_resid_error": ("value", "error", False),
-    "ib_softmax_mse_grad_resid_error_window": ("value", "error", True),
-    "ib_softmax_mse_grad_resid_advantage": ("value", "advantage", False),
-    "ib_softmax_mse_grad_resid_advantage_window": ("value", "advantage", True),
-}
-
 GATE_LOSS_TYPES = (
     "ib_softmax_mse",
     "softmax_mse",
+    "ib_softmax_mse_grad",
     "ib_softmax_mse_window",
-    *_GRAD_GATE_SPECS,
+    "ib_softmax_mse_grad_window",
 )
 
 _WINDOW_GATE_LOSSES = (
     "ib_softmax_mse_window",
-    *(name for name, (_, _, window) in _GRAD_GATE_SPECS.items() if window),
+    "ib_softmax_mse_grad_window",
 )
 
 
@@ -71,24 +54,11 @@ def _mse_broadcast(gate_weights, target):
     return F.mse_loss(gate_weights, expanded)
 
 
-def _grad_scores(output, outsample_y, expert_outputs, residual, feature):
-    """Negative mixture gradient of a point loss with respect to expert weights."""
-    mixture = output.squeeze(-1)
-    target = outsample_y.squeeze(-1)
-    resid = mixture - target
-    if residual == "sign":
-        resid = torch.sign(resid)
-    elif residual != "value":
-        raise ValueError(f"Unknown grad residual={residual!r}")
-    if feature == "level":
-        values = expert_outputs
-    elif feature == "error":
-        values = expert_outputs - target.unsqueeze(1)
-    elif feature == "advantage":
-        values = expert_outputs - mixture.unsqueeze(1)
-    else:
-        raise ValueError(f"Unknown grad feature={feature!r}")
-    return -resid.unsqueeze(1) * values
+def _signed_contributions(output, outsample_y, expert_outputs):
+    return (
+        -torch.sign(output.squeeze(-1) - outsample_y.squeeze(-1)).unsqueeze(1)
+        * expert_outputs
+    )
 
 
 def gate_supervision_loss(
@@ -116,16 +86,16 @@ def gate_supervision_loss(
     if gate_loss_type == "softmax_mse":
         target = _detached_softmax(-expert_losses, dim=0)
         return F.mse_loss(gate_weights.mean(0), target)
+    if gate_loss_type == "ib_softmax_mse_grad":
+        scores = _signed_contributions(output, outsample_y, expert_outputs).mean(dim=[0, -1])
+        target = _detached_softmax(scores, dim=0)
+        return _mse_broadcast(gate_weights, target)
     if gate_loss_type == "ib_softmax_mse_window":
         per_window = torch.stack(per_window_losses, dim=1)
         target = _detached_softmax(-per_window, dim=1)
         return F.mse_loss(gate_weights, target)
-    if gate_loss_type in _GRAD_GATE_SPECS:
-        residual, feature, per_window = _GRAD_GATE_SPECS[gate_loss_type]
-        scores = _grad_scores(output, outsample_y, expert_outputs, residual, feature)
-        if per_window:
-            target = _detached_softmax(scores.mean(dim=-1), dim=1)
-            return F.mse_loss(gate_weights, target)
-        target = _detached_softmax(scores.mean(dim=[0, -1]), dim=0)
-        return _mse_broadcast(gate_weights, target)
+    if gate_loss_type == "ib_softmax_mse_grad_window":
+        scores = _signed_contributions(output, outsample_y, expert_outputs).mean(dim=-1)
+        target = _detached_softmax(scores, dim=1)
+        return F.mse_loss(gate_weights, target)
     raise ValueError(f"Unknown gate_loss_type={gate_loss_type!r}")

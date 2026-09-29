@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import SEED, N_SAMPLES
-from src.moe.moe import NSX
+from src.moe.moe import NSX, NSXFrozen
 
 
 class ConfigSampler:
@@ -100,6 +100,7 @@ class ConfigSampler:
         if experts is not None:
             config['experts'] = experts
 
-        model_instance = NSX(**config)
+        model_cls = NSXFrozen if experts is not None else NSX
+        model_instance = model_cls(**config)
 
         return model_instance
