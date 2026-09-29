@@ -6,7 +6,7 @@ from src.config import DATASETS
 
 ROOT = Path(__file__).resolve().parents[2]
 NSX_PATH = ROOT / 'assets' / 'results'
-SOTA_PATH = ROOT / 'assets' / 'results_sota'
+SOTA_PATH = ROOT / 'assets' / 'results_pretrained'
 
 
 def load_nsx(path: Path) -> pd.DataFrame:

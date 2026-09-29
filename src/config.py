@@ -12,9 +12,9 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y"}
 
 
-DRY_RUN = True
+DRY_RUN = False
 
-MAX_SAMPLES = 3
+MAX_SAMPLES = 30
 SEED = 123
 USE_MPS = _env_bool("USE_MPS", True)
 USE_CUDA = _env_bool("USE_CUDA", False)
@@ -24,7 +24,7 @@ if DRY_RUN:
     N_SAMPLES = 2
     LIMIT_EPOCHS = True
 else:
-    N_SAMPLES = 5000
+    N_SAMPLES = 30
     LIMIT_EPOCHS = False
 
 DATASETS = ['monash_m1_monthly',

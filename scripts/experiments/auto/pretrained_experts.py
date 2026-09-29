@@ -15,7 +15,7 @@ from src.config import ENGINE, LIMIT_EPOCHS, DATASETS, LH_DATASETS, N_SAMPLES
 
 warnings.filterwarnings('ignore')
 
-RESULTS_PATH = Path(__file__).resolve().parents[3] / 'assets' / 'results_sota'
+RESULTS_PATH = Path(__file__).resolve().parents[3] / 'assets' / 'results_pretrained'
 
 if __name__ == '__main__':
     print(RESULTS_PATH.absolute())
@@ -43,14 +43,18 @@ if __name__ == '__main__':
                                                  n_samples=N_SAMPLES,
                                                  engine=ENGINE,
                                                  limit_epochs=LIMIT_EPOCHS,
-                                                 skip_nsx=True,
+                                                 skip_nsx=False,
                                                  input_size=n_lags * 2)
 
         nf = NeuralForecast(models=models, freq=freq)
         nf.fit(df=train)
         fcst = nf.predict()
 
-        experts = [auto_model.model for auto_model in nf.models]
+        experts = [
+            auto_model.model
+            for auto_model in nf.models
+            if auto_model.alias != 'AutoNSX'
+        ]
 
         models_nsxf = ModelsConfig.get_auto_nsxf_model(
             horizon=horizon,
@@ -64,7 +68,7 @@ if __name__ == '__main__':
         nf2.fit(df=train)
         fcst2 = nf2.predict()
 
-        fcst['AutoNSX'] = fcst2['AutoNSX'].values
+        fcst['AutoNSXF'] = fcst2['AutoNSXF'].values
 
         cv = test.merge(fcst, on=['unique_id', 'ds'], how='left')
         print(cv)
