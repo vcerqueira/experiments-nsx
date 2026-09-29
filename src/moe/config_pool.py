@@ -52,7 +52,7 @@ CONFIG_POOL = {
         "batch_size": tune.choice([128]),
         "windows_batch_size": tune.choice([256, 512]),
         "random_seed": tune.choice([18]),
-        "pooling": tune.choice(["sparse", "straight_through"]),
+        "pooling": tune.choice(["sparse"]),
         "k": tune.choice([4]),
         "gate": tune.choice(["linear_bias"]),
         "series_state": tune.choice([False]),
