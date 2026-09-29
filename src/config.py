@@ -12,7 +12,7 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y"}
 
 
-DRY_RUN = False
+DRY_RUN = True
 
 MAX_SAMPLES = 3
 SEED = 123
@@ -21,7 +21,7 @@ USE_CUDA = _env_bool("USE_CUDA", False)
 ENGINE = "mps" if USE_MPS else ("gpu" if USE_CUDA else "cpu")
 
 if DRY_RUN:
-    N_SAMPLES = 20
+    N_SAMPLES = 2
     LIMIT_EPOCHS = True
 else:
     N_SAMPLES = 5000

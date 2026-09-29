@@ -26,17 +26,20 @@ from neuralforecast.models import (NBEATS,
                                    TFT,
                                    DeepNPTS)
 
+from src.moe.auto import AutoNSX, AutoNSXFrozen
+
 
 class ModelsConfig:
     AUTO_MODEL_CLASSES = {
-        'AutoTFT': AutoTFT,
-        'AutoNBEATS': AutoNBEATS,
-        'AutoTiDE': AutoTiDE,
-        'AutoNLinear': AutoNLinear,
-        'AutoKAN': AutoKAN,
-        'AutoMLP': AutoMLP,
-        'AutoDLinear': AutoDLinear,
-        'AutoNHITS': AutoNHITS,
+        'AutoNSX': AutoNSX,
+        # 'AutoTFT': AutoTFT,
+        # 'AutoNBEATS': AutoNBEATS,
+        # 'AutoTiDE': AutoTiDE,
+        # 'AutoNLinear': AutoNLinear,
+        # 'AutoKAN': AutoKAN,
+        # 'AutoMLP': AutoMLP,
+        # 'AutoDLinear': AutoDLinear,
+        # 'AutoNHITS': AutoNHITS,
         'AutoDeepNPTS': AutoDeepNPTS,
         'AutoPatchTST': AutoPatchTST,
     }
@@ -47,12 +50,24 @@ class ModelsConfig:
                            n_samples: int,
                            engine: str = 'cpu',
                            limit_epochs: bool = False,
+                           skip_nsx: bool = False,
+                           input_size: Optional[int] = None,
                            limit_val_batches: Optional[int] = None):
 
         models = []
         for mod_name, mod in cls.AUTO_MODEL_CLASSES.items():
+            if skip_nsx:
+                if mod_name == 'AutoNSX':
+                    continue
+
             config = deepcopy(mod.default_config)
             config['accelerator'] = engine
+            if input_size is not None:
+                # A frozen mixture feeds every expert the same window.
+                config.pop('input_size_multiplier', None)
+                config.pop('inference_input_size_multiplier', None)
+                config['input_size'] = input_size
+                config['inference_input_size'] = input_size
 
             if limit_epochs:
                 config['max_steps'] = 2
@@ -82,6 +97,47 @@ class ModelsConfig:
 
         return models
 
+    @classmethod
+    def get_auto_nsxf_model(cls,
+                            horizon: int,
+                            experts: list,
+                            n_samples: int,
+                            engine: str = 'cpu',
+                            limit_epochs: bool = False,
+                            limit_val_batches: Optional[int] = None):
+
+        config = deepcopy(AutoNSXFrozen.default_config)
+        config['accelerator'] = engine
+
+        if limit_epochs:
+            config['max_steps'] = 2
+
+        if limit_val_batches is not None:
+            config['limit_val_batches'] = limit_val_batches
+
+        model_instance = AutoNSXFrozen(
+            h=horizon,
+            experts=experts,
+            config=config,
+            num_samples=n_samples,
+            alias='AutoNSX',
+            valid_loss=MAE(),
+            refit_with_val=True,
+            backend="ray",
+            ray_options=RayOptions(
+                scheduler=ASHAScheduler(
+                    max_t=30,
+                    grace_period=1,
+                    reduction_factor=4,
+                    brackets=1,
+                )
+            ),
+        )
+
+        models = [model_instance]
+
+        return models
+
 
 class BaseModelsConfig:
     MODEL_CLASSES = {
@@ -103,7 +159,6 @@ class BaseModelsConfig:
                       input_size: int,
                       engine: str = 'cpu',
                       limit_epochs: bool = False):
-
         models = []
         for mod_name, mod in cls.MODEL_CLASSES.items():
             max_steps_ = 2 if limit_epochs else 1000

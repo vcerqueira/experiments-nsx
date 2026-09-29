@@ -3,12 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from neuralforecast.common._modules import MLP as MLPLayer
 
-GATE_NAMES = ("linear", "linear_bias", "mlp")
+# GATE_NAMES = ("linear", "linear_bias", "mlp")
+GATE_NAMES = ("linear_bias",)
 
 GATE_LOSS_TYPES = (
-    "ib_softmax_mse",
-    "softmax_mse",
-    "ib_softmax_mse_grad",
+    # "ib_softmax_mse",
+    # "softmax_mse",
+    # "ib_softmax_mse_grad",
     "ib_softmax_mse_window",
     "ib_softmax_mse_grad_window",
 )

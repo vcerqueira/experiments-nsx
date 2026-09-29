@@ -3,8 +3,8 @@ from neuralforecast.models import MLP, KAN, NBEATS
 
 EXPERT_REGISTRY = {
     "mlp": MLP,
-    "kan": KAN,
-    "nbeats": NBEATS,
+    # "kan": KAN,
+    # "nbeats": NBEATS,
 }
 
 
@@ -13,9 +13,9 @@ def expert_init_kwargs(expert_arch, expert_kwargs):
     if expert_arch == "nbeats":
         kwargs.setdefault("stack_types", ["identity"])
         kwargs.setdefault("n_blocks", [1])
-        kwargs.setdefault("mlp_units", [[128, 128]])
+        kwargs.setdefault("mlp_units", [[64, 64]])
     elif expert_arch == "kan":
-        kwargs.setdefault("hidden_size", 256)
+        kwargs.setdefault("hidden_size", 128)
     elif expert_arch == "mlp":
         kwargs.setdefault("hidden_size", 128)
     return kwargs
