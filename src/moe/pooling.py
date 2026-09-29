@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+POOLING_NAMES = ("dense", "sparse")
+
 
 class DensePooling(nn.Module):
     """Softmax over all experts."""
@@ -22,29 +24,6 @@ class SparsePooling(nn.Module):
         gate_weights = torch.zeros_like(gate_logits)
         gate_weights.scatter_(1, topk_indices, F.softmax(topk_values, dim=1))
         return gate_weights
-
-
-class StraightThroughPooling(nn.Module):
-    """Hard one-hot in the forward pass, softmax gradients in the backward pass."""
-
-    def __init__(self, temperature: float = 1.0, hard: bool = True):
-        super().__init__()
-        self.temperature = temperature
-        self.hard = hard
-
-    def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
-        gates_soft = F.softmax(gate_logits / self.temperature, dim=-1)
-        if not self.hard:
-            return gates_soft
-
-        gates_hard = F.one_hot(
-            gates_soft.argmax(dim=-1),
-            num_classes=gate_logits.size(-1),
-        ).float()
-        return (gates_hard - gates_soft).detach() + gates_soft
-
-
-POOLING_NAMES = ("dense", "sparse")
 
 
 def build_pooling(name: str, k: int) -> nn.Module:

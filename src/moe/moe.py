@@ -10,17 +10,6 @@ from src.moe.gating import (
     validate_gate_loss_type,
 )
 from src.moe.pooling import POOLING_NAMES, build_pooling
-from src.moe.series_state import (
-    accumulate_losses,
-    arm_predict,
-    arm_validation,
-    consume_predict,
-    consume_validation,
-    prepare_fit,
-    series_scores,
-    window_series_index,
-    wrap_predict_dataset,
-)
 
 
 class NSX(BaseModel):
@@ -45,21 +34,13 @@ class NSX(BaseModel):
         k (int, optional): Top-k experts for sparse pooling. Default 3.
         gate (str, optional): ``linear``, ``linear_bias``, or ``mlp``. Default ``linear``.
         gate_loss_type (str, optional): One of ``ib_softmax_mse``, ``softmax_mse``,
-            ``ib_softmax_mse_grad``, ``ib_softmax_mse_window``,
-            ``ib_softmax_mse_grad_window``. Default ``ib_softmax_mse``.
-        series_state (bool, optional): Per-series Hedge table, added to the
-            trained gate logits. Default False.
-        series_state_eta (float, optional): Hedge step size. Must be positive.
-            Default 1.0.
-        series_state_train_only (bool, optional): Add the Hedge scores only
-            during training. Validation and predict then use the gate on the
-            input window alone. Default False.
-        disagreement_scale (float, optional): Soften the combined mixture by
-            ``1 + scale *`` total variation between the gate and the series
-            prior. Requires ``series_state`` when positive. Default 0.
-        frozen_loss (str, optional): Objective when ``frozen_experts`` is true.
-            ``gate_mixture`` uses ``gate_loss + combined_loss``. ``gate`` uses
-            ``gate_loss`` only. Default ``gate_mixture``.
+            ``ib_softmax_mse_window``, or a grad target. Grad names are
+            ``ib_softmax_mse_grad`` with an optional ``_error`` or
+            ``_advantage`` feature, an optional ``_resid`` residual, and an
+            optional ``_window`` suffix. Default ``ib_softmax_mse``.
+        balance_gate_loss (bool, optional): Multiply ``gate_loss`` by the
+            detached ratio ``combined_loss / gate_loss`` so the two terms match
+            on each batch. Default False.
         **trainer_kwargs: Remaining arguments are NeuralForecast ``BaseModel``
             training arguments (learning rate, batch size, scaler, and so on).
     """
@@ -107,12 +88,8 @@ class NSX(BaseModel):
                  k: int = 3,
                  gate: str = 'linear',
                  gate_loss_type: str = 'ib_softmax_mse',
-                 series_state: bool = False,
-                 series_state_eta: float = 1.0,
-                 series_state_train_only: bool = False,
-                 disagreement_scale: float = 0.0,
+                 balance_gate_loss: bool = False,
                  frozen_experts: bool = False,
-                 frozen_loss: str = 'gate_mixture',
                  **trainer_kwargs):
         if frozen_experts and not experts:
             raise ValueError('frozen_experts=True requires trained modules in experts')
@@ -121,10 +98,6 @@ class NSX(BaseModel):
             pooling=pooling,
             gate=gate,
             gate_loss_type=gate_loss_type,
-            series_state=series_state,
-            series_state_eta=series_state_eta,
-            disagreement_scale=disagreement_scale,
-            frozen_loss=frozen_loss,
         )
 
         super(NSX, self).__init__(h=h,
@@ -186,15 +159,7 @@ class NSX(BaseModel):
         self.pooling = build_pooling(pooling, self.k)
 
         self.gate_loss_type = gate_loss_type
-        self.series_state = bool(series_state)
-        self.series_state_eta = float(series_state_eta)
-        self.series_state_train_only = bool(series_state_train_only)
-        self.disagreement_scale = float(disagreement_scale)
-        self.frozen_loss = frozen_loss
-        self._val_hedge_weights = None
-        self._val_hedge_cursor = 0
-        self._predict_hedge_weights = None
-        self._predict_hedge_cursor = 0
+        self.balance_gate_loss = bool(balance_gate_loss)
 
         # A fully frozen model would leave Adam with no parameters. This scalar
         # keeps the trainer alive and does not affect the forecast.
@@ -234,10 +199,6 @@ class NSX(BaseModel):
         pooling,
         gate,
         gate_loss_type,
-        series_state,
-        series_state_eta,
-        disagreement_scale,
-        frozen_loss,
     ):
         if k < 1:
             raise ValueError(f"k must be >= 1, got {k}")
@@ -248,20 +209,6 @@ class NSX(BaseModel):
             expected = ", ".join(repr(name) for name in GATE_NAMES)
             raise ValueError(f"Unknown gate={gate!r}; expected {expected}")
         validate_gate_loss_type(gate_loss_type)
-        if disagreement_scale < 0:
-            raise ValueError(
-                f"disagreement_scale must be >= 0, got {disagreement_scale}"
-            )
-        if disagreement_scale > 0 and not series_state:
-            raise ValueError("disagreement_scale requires series_state")
-        if series_state and series_state_eta <= 0:
-            raise ValueError(
-                f"series_state_eta must be > 0, got {series_state_eta}"
-            )
-        if frozen_loss not in ("gate_mixture", "gate"):
-            raise ValueError(
-                f"Unknown frozen_loss={frozen_loss!r}; expected 'gate_mixture' or 'gate'"
-            )
 
     def forward(self, windows_batch: dict, return_components: bool = False):
         """
@@ -276,25 +223,11 @@ class NSX(BaseModel):
                 full_gate_weights are the dense softmax the gate loss supervises.
         """
         insample_y = windows_batch['insample_y']  # [B, L] or [B, L, 1]
-        series_prior = windows_batch.get("series_scores")
-        if self._use_series_prior() and self._is_validating() and series_prior is None:
-            # Validation does not pass the table. Consume the rows armed for
-            # this batch. Predict passes them explicitly so extra explain
-            # forwards cannot walk the same cursor.
-            series_prior = consume_validation(self, insample_y.shape[0])
-        if self._use_series_prior():
-            if series_prior is None:
-                raise RuntimeError("series_state requires series scores on the batch")
-            gate_logits = self.gate(insample_y.squeeze(-1))
-            logits = self._combine_logits(gate_logits, series_prior)
-            full_gate_weights = torch.softmax(logits, dim=1)
-            gate_weights = self.pooling(logits)
-        else:
-            gate_logits = self.gate(insample_y.squeeze(-1))
-            full_gate_weights = torch.softmax(gate_logits, dim=1)  # [B, num_experts]
-            # The forecast uses the pooled mixture. Expert losses and gate targets
-            # still see every expert through full_gate_weights.
-            gate_weights = self.pooling(gate_logits)
+        gate_logits = self.gate(insample_y.squeeze(-1))
+        full_gate_weights = torch.softmax(gate_logits, dim=1)  # [B, num_experts]
+        # The forecast uses the pooled mixture. Expert losses and gate targets
+        # still see every expert through full_gate_weights.
+        gate_weights = self.pooling(gate_logits)
 
         if self.frozen_experts:
             with torch.no_grad():
@@ -317,90 +250,6 @@ class NSX(BaseModel):
                 expert_output = expert_output.squeeze(-1)
             expert_outputs.append(expert_output)
         return torch.stack(expert_outputs, dim=1)  # [B, E, h]
-
-    def _use_series_prior(self):
-        """Hedge scores shift the gate. Train-only mode keeps that shift inside training."""
-        if not self.series_state:
-            return False
-        if self.series_state_train_only and not self.training:
-            return False
-        return True
-
-    def _is_validating(self):
-        trainer = getattr(self, "_trainer", None)
-        if trainer is None:
-            return False
-        # The sanity check runs this same validation loop with the stage set to
-        # SANITY_CHECKING, so trainer.validating is false there.
-        return bool(trainer.validating or trainer.sanity_checking)
-
-    def on_fit_start(self):
-        super().on_fit_start()
-        if not self.series_state:
-            return
-        prepare_fit(self)
-
-    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx=0):
-        if (
-            not self.series_state
-            or self.series_state_train_only
-            or getattr(self, "val_size", 0) == 0
-        ):
-            return
-        arm_validation(self, batch)
-
-    def predict(self, dataset, **kwargs):
-        if self.series_state and not self.series_state_train_only:
-            dataset = wrap_predict_dataset(dataset)
-        return super().predict(dataset, **kwargs)
-
-    def _predict_step_direct(self, batch, batch_idx, recursive=False):
-        if self.series_state and not self.series_state_train_only and not recursive:
-            arm_predict(self, batch)
-        return super()._predict_step_direct(batch, batch_idx, recursive=recursive)
-
-    def _predict_step_direct_batch(
-        self, insample_y, insample_mask, hist_exog, futr_exog, stat_exog, y_idx
-    ):
-        # Kept so predict can pass series scores into forward. The parent
-        # method builds the batch itself, and explain calls the model again
-        # without those scores.
-        windows_batch = dict(
-            insample_y=insample_y,
-            insample_mask=insample_mask,
-            futr_exog=futr_exog,
-            hist_exog=hist_exog,
-            stat_exog=stat_exog,
-        )
-        if self.series_state and not self.series_state_train_only:
-            windows_batch["series_scores"] = consume_predict(self, insample_y.shape[0])
-        output_batch = self(windows_batch)
-        output_batch = self.loss.domain_map(output_batch)
-        if self.loss.is_distribution_output:
-            y_loc, y_scale = self._get_loc_scale(y_idx)
-            distr_args = self.loss.scale_decouple(
-                output=output_batch, loc=y_loc, scale=y_scale
-            )
-            _, sample_mean, quants = self.loss.sample(distr_args=distr_args)
-            y_hat = torch.concat((sample_mean, quants), axis=-1)
-            if self.loss.return_params:
-                distr_args = torch.stack(distr_args, dim=-1)
-                if distr_args.ndim > 4:
-                    distr_args = distr_args.flatten(-2, -1)
-                y_hat = torch.concat((y_hat, distr_args), axis=-1)
-            return y_hat
-        return self._inv_normalization(y_hat=output_batch, y_idx=y_idx)
-
-    def _combine_logits(self, gate_logits, series_scores):
-        """Add the detached series prior, then divide by the disagreement temperature."""
-        combined = gate_logits + series_scores
-        if self.disagreement_scale == 0:
-            return combined
-        disagreement = 0.5 * (
-            torch.softmax(gate_logits, dim=-1) - torch.softmax(series_scores, dim=-1)
-        ).abs().sum(dim=-1, keepdim=True)
-        temperature = (1 + self.disagreement_scale * disagreement).detach()
-        return combined / temperature
 
     def training_step(self, batch, batch_idx):
         if self.RECURRENT:
@@ -466,9 +315,6 @@ class NSX(BaseModel):
             hist_exog=hist_exog,
             stat_exog=stat_exog,
         )
-        if self.series_state:
-            series_ids = window_series_index(self, batch, final_condition, w_idxs)
-            windows_batch["series_scores"] = series_scores(self, series_ids)
 
         # Get predictions and component analysis
         output, expert_outputs, gate_weights, mixture_weights = self(
@@ -499,11 +345,6 @@ class NSX(BaseModel):
         expert_losses_tensor = torch.stack(expert_losses)
         expert_loss = expert_losses_tensor.mean()
 
-        if self.series_state:
-            if not per_window_losses:
-                raise ValueError("series_state requires a point forecast loss")
-            accumulate_losses(self, batch, final_condition, w_idxs, per_window_losses)
-
         # gate_weights is the dense softmax. The forecast used mixture_weights.
         gate_loss = gate_supervision_loss(
             self.gate_loss_type,
@@ -529,15 +370,23 @@ class NSX(BaseModel):
                 insample_y=insample_y,
             )
 
+        gate_term = gate_loss
+        if self.balance_gate_loss:
+            gate_scale = combined_loss.detach() / gate_loss.detach().clamp_min(1e-8)
+            gate_term = gate_loss * gate_scale
+            self.log(
+                "gate_scale",
+                gate_scale.detach(),
+                batch_size=outsample_y.size(0),
+                on_epoch=True,
+            )
+
         if self.frozen_experts:
             # Expert weights are fixed, so expert_loss cannot train them. It
             # stays in the logs because the gate target is built from it.
-            if self.frozen_loss == "gate":
-                total_loss = gate_loss
-            else:
-                total_loss = gate_loss + combined_loss
+            total_loss = gate_term + combined_loss
         else:
-            total_loss = expert_loss + gate_loss + combined_loss
+            total_loss = expert_loss + gate_term + combined_loss
 
         # Log all components
         self.log("combined_loss", combined_loss.detach(), batch_size=outsample_y.size(0), on_epoch=True)
