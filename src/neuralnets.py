@@ -13,6 +13,7 @@ from neuralforecast.auto import (AutoNBEATS,
                                  AutoNHITS,
                                  AutoPatchTST,
                                  AutoTFT,
+                                 AutoRMoK,
                                  AutoDeepNPTS)
 
 from neuralforecast.models import (NBEATS,
@@ -27,21 +28,24 @@ from neuralforecast.models import (NBEATS,
                                    DeepNPTS)
 
 from src.moe.auto import AutoNSX, AutoNSXFrozen
+from src.rmok2 import AutoRMoK2
 
 
 class ModelsConfig:
     AUTO_MODEL_CLASSES = {
-        'AutoNSX': AutoNSX,
-        'AutoTFT': AutoTFT,
-        'AutoNBEATS': AutoNBEATS,
-        'AutoTiDE': AutoTiDE,
-        'AutoNLinear': AutoNLinear,
-        'AutoKAN': AutoKAN,
-        'AutoMLP': AutoMLP,
-        'AutoDLinear': AutoDLinear,
-        'AutoNHITS': AutoNHITS,
-        'AutoDeepNPTS': AutoDeepNPTS,
-        'AutoPatchTST': AutoPatchTST,
+        # 'AutoNSX': AutoNSX,
+        # 'AutoTFT': AutoTFT,
+        'AutoRMoK': AutoRMoK,
+        'AutoRMoK2': AutoRMoK2,
+        # 'AutoNBEATS': AutoNBEATS,
+        # 'AutoTiDE': AutoTiDE,
+        # 'AutoNLinear': AutoNLinear,
+        # 'AutoKAN': AutoKAN,
+        # 'AutoMLP': AutoMLP,
+        # 'AutoDLinear': AutoDLinear,
+        # 'AutoNHITS': AutoNHITS,
+        # 'AutoDeepNPTS': AutoDeepNPTS,
+        # 'AutoPatchTST': AutoPatchTST,
     }
 
     @classmethod
@@ -52,6 +56,7 @@ class ModelsConfig:
                            limit_epochs: bool = False,
                            skip_nsx: bool = False,
                            input_size: Optional[int] = None,
+                           n_series: Optional[int] = None,
                            limit_val_batches: Optional[int] = None):
 
         models = []
@@ -75,6 +80,15 @@ class ModelsConfig:
             if limit_val_batches is not None:
                 config['limit_val_batches'] = limit_val_batches
 
+            if mod_name in ['AutoRMoK', 'AutoRMoK2']:
+                if n_series is None:
+                    raise ValueError(
+                        f"{mod_name} requires n_series, the number of series in the dataset"
+                    )
+                config_special = {'n_series': int(n_series)}
+            else:
+                config_special = {}
+
             model_instance = mod(
                 h=horizon,
                 config=config,
@@ -91,6 +105,7 @@ class ModelsConfig:
                         brackets=1,
                     )
                 ),
+                **config_special
             )
 
             models.append(model_instance)

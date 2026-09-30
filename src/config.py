@@ -24,7 +24,7 @@ if DRY_RUN:
     N_SAMPLES = 2
     LIMIT_EPOCHS = True
 else:
-    N_SAMPLES = 30
+    N_SAMPLES = 5
     LIMIT_EPOCHS = False
 
 DATASETS = ['monash_m1_monthly',
