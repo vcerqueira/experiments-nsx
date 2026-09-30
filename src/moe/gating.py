@@ -38,9 +38,9 @@ def build_gate(kind, input_size, num_experts):
             input_size,
             num_experts,
             activation="ReLU",
-            hidden_size=32,
+            hidden_size=16,
             num_layers=1,
-            dropout=0.1,
+            dropout=0.05,
         )
     expected = ", ".join(repr(name) for name in GATE_NAMES)
     raise ValueError(f"Unknown gate={kind!r}; expected {expected}")
